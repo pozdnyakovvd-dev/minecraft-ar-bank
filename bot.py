@@ -251,7 +251,7 @@ def record(kind, sender, receiver, amount, actor, note=""):
         if kind in ("withdraw", "transfer"):
             bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_player=? THEN amount ELSE 0 END),0)-
                                       COALESCE(SUM(CASE WHEN from_player=? THEN amount ELSE 0 END),0)
-                               FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')"",
+                               FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
                             (sender, sender)).fetchone()[0]
             if bal < amount:
                 raise ValueError(f"Недостаточно средств. Баланс: {bal} AR.")

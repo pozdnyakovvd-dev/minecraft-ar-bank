@@ -71,6 +71,24 @@ def init_db():
             created_at TEXT NOT NULL,
             active INTEGER NOT NULL DEFAULT 1
         );
+        CREATE TABLE IF NOT EXISTS card_access (
+            card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+            granted_by INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(card_id, player_id)
+        );
+        CREATE TABLE IF NOT EXISTS withdrawal_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_player INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+            requester_player INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+            source_card_id INTEGER REFERENCES cards(id) ON DELETE SET NULL,
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            closed_at TEXT,
+            banker_telegram_id INTEGER
+        );
         CREATE TABLE IF NOT EXISTS roles (
             telegram_id INTEGER NOT NULL,
             permission TEXT NOT NULL,
@@ -81,6 +99,8 @@ def init_db():
             kind TEXT NOT NULL,
             from_player INTEGER REFERENCES players(id),
             to_player INTEGER REFERENCES players(id),
+            from_card_id INTEGER REFERENCES cards(id),
+            to_card_id INTEGER REFERENCES cards(id),
             amount INTEGER NOT NULL CHECK(amount > 0),
             actor_telegram_id INTEGER NOT NULL,
             note TEXT NOT NULL DEFAULT '',
@@ -97,6 +117,19 @@ def init_db():
         CREATE INDEX IF NOT EXISTS ledger_from_idx ON ledger(from_player, id DESC);
         CREATE INDEX IF NOT EXISTS ledger_to_idx ON ledger(to_player, id DESC);
         """)
+        ledger_columns = {row["name"] for row in c.execute("PRAGMA table_info(ledger)").fetchall()}
+        if "from_card_id" not in ledger_columns:
+            c.execute("ALTER TABLE ledger ADD COLUMN from_card_id INTEGER REFERENCES cards(id)")
+        if "to_card_id" not in ledger_columns:
+            c.execute("ALTER TABLE ledger ADD COLUMN to_card_id INTEGER REFERENCES cards(id)")
+        c.execute("CREATE INDEX IF NOT EXISTS ledger_from_card_idx ON ledger(from_card_id, id DESC)")
+        c.execute("CREATE INDEX IF NOT EXISTS ledger_to_card_idx ON ledger(to_card_id, id DESC)")
+        c.execute("""UPDATE ledger SET from_card_id=(SELECT MIN(id) FROM cards WHERE player_id=ledger.from_player)
+                     WHERE from_player IS NOT NULL AND from_card_id IS NULL""")
+        c.execute("""UPDATE ledger SET to_card_id=(SELECT MIN(id) FROM cards WHERE player_id=ledger.to_player)
+                     WHERE to_player IS NOT NULL AND to_card_id IS NULL""")
+        c.execute("""UPDATE withdrawal_requests SET source_card_id=(SELECT MIN(id) FROM cards WHERE player_id=withdrawal_requests.account_player)
+                     WHERE source_card_id IS NULL""")
         if STARTING_VAULT.isdigit():
             c.execute("INSERT OR IGNORE INTO bank_meta(key,value) VALUES('starting_vault_ar',?)", (STARTING_VAULT,))
         for value in os.environ.get("BANK_ADMIN_IDS", "").split(","):
@@ -156,19 +189,93 @@ def player_by_name_or_card(value):
                          (value, value)).fetchone()
 
 
-def balance(player_id):
+def player_by_name(value):
     with db() as c:
-        row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_player=? THEN amount ELSE 0 END),0)-
-                                   COALESCE(SUM(CASE WHEN from_player=? THEN amount ELSE 0 END),0) AS value
+        return c.execute("SELECT * FROM players WHERE minecraft_name=? COLLATE NOCASE", (value,)).fetchone()
+
+
+def balance(card_id):
+    with db() as c:
+        row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
+                                   COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0) AS value
                             FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
-                         (player_id, player_id)).fetchone()
+                         (card_id, card_id)).fetchone()
     return int(row["value"])
+
+
+def player_balance(player_id):
+    with db() as c:
+        card_ids = c.execute("SELECT id FROM cards WHERE player_id=? AND active=1", (player_id,)).fetchall()
+    return sum(balance(row["id"]) for row in card_ids)
+
+
+def pending_withdrawals(card_id, exclude_id=None):
+    with db() as c:
+        if exclude_id is None:
+            row = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (card_id,)).fetchone()
+        else:
+            row = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending' AND id<>?", (card_id, exclude_id)).fetchone()
+    return int(row[0])
+
+
+def available_balance(card_id):
+    return balance(card_id) - pending_withdrawals(card_id)
+
+
+def shared_cards(player_id):
+    with db() as c:
+        return c.execute("""SELECT k.id AS card_id,k.number,p.id AS owner_id,p.minecraft_name AS owner_name
+            FROM card_access a JOIN cards k ON k.id=a.card_id JOIN players p ON p.id=k.player_id
+            WHERE a.player_id=? AND k.active=1 ORDER BY p.minecraft_name COLLATE NOCASE,k.number""", (player_id,)).fetchall()
+
+
+def card_telegram_ids(card_id):
+    with db() as c:
+        rows = c.execute("""SELECT DISTINCT t.telegram_id FROM telegram_users t
+            WHERE t.player_id IN (
+                SELECT player_id FROM cards WHERE id=?
+                UNION SELECT player_id FROM card_access WHERE card_id=?
+            )""", (card_id, card_id)).fetchall()
+    return [row["telegram_id"] for row in rows]
+
+
+def notify_card_users(card_id, message, exclude_telegram_id=None):
+    for telegram_id in card_telegram_ids(card_id):
+        if telegram_id == exclude_telegram_id:
+            continue
+        try:
+            send(telegram_id, message)
+        except Exception as exc:
+            print(f"Notification delivery failed for Telegram user {telegram_id}: {exc}")
+
+
+def accessible_accounts(player_id):
+    with db() as c:
+        own_cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (player_id,)).fetchall()
+    accounts = [{"account_id": player_id, "card_id": card["id"], "card_number": card["number"], "owner_name": None}
+                for card in own_cards]
+    for row in shared_cards(player_id):
+        accounts.append({"account_id": row["owner_id"], "card_id": row["card_id"],
+                         "card_number": row["number"], "owner_name": row["owner_name"]})
+    return accounts
+
+
+def can_use_account(player_id, account_id, card_id):
+    if card_id is None:
+        return False
+    with db() as c:
+        own = c.execute("SELECT 1 FROM cards WHERE id=? AND player_id=? AND active=1", (card_id, player_id)).fetchone()
+        if own and player_id == account_id:
+            return True
+        return c.execute("""SELECT 1 FROM card_access a JOIN cards k ON k.id=a.card_id
+            WHERE a.player_id=? AND k.player_id=? AND k.id=? AND k.active=1""",
+                         (player_id, account_id, card_id)).fetchone() is not None
 
 
 def total_balances():
     with db() as c:
-        row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_player IS NOT NULL THEN amount ELSE 0 END),0)-
-                                   COALESCE(SUM(CASE WHEN from_player IS NOT NULL THEN amount ELSE 0 END),0) AS value
+        row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id IS NOT NULL THEN amount ELSE 0 END),0)-
+                                   COALESCE(SUM(CASE WHEN from_card_id IS NOT NULL THEN amount ELSE 0 END),0) AS value
                             FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""").fetchone()
     return int(row["value"])
 
@@ -214,11 +321,13 @@ def add_role(tid, permission):
 
 def menu(tid, show_home=False):
     rows = [[("💳 Баланс и карты", "account"), ("↔️ Перевод", "transfer")],
-            [("📜 История", "history")]]
+            [("📜 История", "history"), ("💸 Запросить снятие", "withdraw_request")]]
     if has_permission(tid, "banker"):
-        rows.append([("🏦 Внести AR", "deposit"), ("💸 Снять AR", "withdraw")])
+        rows.append([("🏦 Внести АР", "deposit"), ("💸 Снять АР", "withdraw")])
+        rows.append([("📨 Заявки на снятие", "withdraw_requests")])
     if has_permission(tid, "view_ledger"):
         rows.append([("📊 Сводка банка", "summary"), ("📚 Журнал банка", "ledger")])
+        rows.append([("👥 Игроки и карты", "players")])
     if has_permission(tid, "admin"):
         rows.append([("🧹 Сбросить тестовую базу", "reset_prompt")])
     if show_home:
@@ -231,51 +340,133 @@ def home_markup():
     return keyboard([[('🏠 Главное меню', 'home')]])
 
 
-def history_text(player_id):
+def history_text(player_id, telegram_id=None):
     with db() as c:
-        rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver
+        if telegram_id is None:
+            rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver
             FROM ledger l LEFT JOIN players a ON a.id=l.from_player LEFT JOIN players b ON b.id=l.to_player
             WHERE l.from_player=? OR l.to_player=? ORDER BY l.id DESC LIMIT 10""", (player_id, player_id)).fetchall()
+        else:
+            rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver
+            FROM ledger l LEFT JOIN players a ON a.id=l.from_player LEFT JOIN players b ON b.id=l.to_player
+            WHERE l.from_player=? OR l.to_player=? OR l.actor_telegram_id=? ORDER BY l.id DESC LIMIT 10""",
+                              (player_id, player_id, telegram_id)).fetchall()
     if not rows:
         return "Операций пока нет."
     labels = {"deposit": "Внесение", "withdraw": "Снятие", "transfer": "Перевод", "correction": "Исправление"}
     result = []
     for r in rows:
-        if r["kind"] == "deposit": detail = "внесение наличных AR"
-        elif r["kind"] == "withdraw": detail = "снятие наличных AR"
+        if r["kind"] == "deposit": detail = "внесение наличных АР"
+        elif r["kind"] == "withdraw": detail = "снятие наличных АР"
         elif r["kind"] == "transfer": detail = f"{r['sender']} → {r['receiver']}"
         else: detail = r["note"] or "исправление"
         suffix = f" ({r['note']})" if r["note"] else ""
-        result.append(f"#{r['id']} · {labels.get(r['kind'], r['kind'])}: {detail}, {r['amount']} AR{suffix}")
+        result.append(f"#{r['id']} · {labels.get(r['kind'], r['kind'])}: {detail}, {r['amount']} АР{suffix}")
     return "Последние операции:\n" + "\n".join(result)
 
 
-def record(kind, sender, receiver, amount, actor, note=""):
+def record(kind, sender, receiver, amount, actor, note="", from_card_id=None, to_card_id=None):
     if amount <= 0:
         raise ValueError("Сумма должна быть целым числом больше нуля.")
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
-        # SQLite serializes writes; this balance check and insertion are one transaction.
         if kind in ("withdraw", "transfer"):
-            bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_player=? THEN amount ELSE 0 END),0)-
-                                      COALESCE(SUM(CASE WHEN from_player=? THEN amount ELSE 0 END),0)
+            owner = c.execute("SELECT player_id FROM cards WHERE id=? AND active=1", (from_card_id,)).fetchone()
+            if not owner or owner["player_id"] != sender:
+                raise ValueError("Карта списания не найдена или выключена.")
+            bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
+                                      COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
                                FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
-                            (sender, sender)).fetchone()[0]
-            if bal < amount:
-                raise ValueError(f"Недостаточно средств. Баланс: {bal} AR.")
+                            (from_card_id, from_card_id)).fetchone()[0]
+            held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (from_card_id,)).fetchone()[0]
+            available = int(bal) - int(held)
+            if available < amount:
+                raise ValueError(f"Недостаточно свободных средств на карте. Доступно: {available} АР.")
+        if kind in ("deposit", "transfer"):
+            owner = c.execute("SELECT player_id FROM cards WHERE id=? AND active=1", (to_card_id,)).fetchone()
+            if not owner or owner["player_id"] != receiver:
+                raise ValueError("Карта зачисления не найдена или выключена.")
         if kind == "withdraw":
             opening = c.execute("SELECT value FROM bank_meta WHERE key='starting_vault_ar'").fetchone()
             cash_moves = c.execute("SELECT COALESCE(SUM(amount),0) FROM vault_events").fetchone()[0]
             available_cash = int(opening["value"] if opening else 0) + int(cash_moves)
             if available_cash < amount:
-                raise ValueError(f"В хранилище недостаточно AR. Доступно: {available_cash} AR.")
-        c.execute("INSERT INTO ledger(kind,from_player,to_player,amount,actor_telegram_id,note,created_at) VALUES(?,?,?,?,?,?,?)",
-                  (kind, sender, receiver, amount, actor, note, now()))
+                raise ValueError(f"В хранилище недостаточно АР. Доступно: {available_cash} АР.")
+        c.execute("""INSERT INTO ledger(kind,from_player,to_player,from_card_id,to_card_id,amount,actor_telegram_id,note,created_at)
+                     VALUES(?,?,?,?,?,?,?,?,?)""",
+                  (kind, sender, receiver, from_card_id, to_card_id, amount, actor, note, now()))
         if kind == "deposit":
             c.execute("INSERT INTO vault_events(amount,kind,actor_telegram_id,created_at) VALUES(?,?,?,?)", (amount, kind, actor, now()))
         elif kind == "withdraw":
             c.execute("INSERT INTO vault_events(amount,kind,actor_telegram_id,created_at) VALUES(?,?,?,?)", (-amount, kind, actor, now()))
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def create_withdrawal_request(account_id, requester_id, source_card_id, amount):
+    if amount <= 0:
+        raise ValueError("Сумма должна быть целым числом больше нуля.")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        card = c.execute("SELECT player_id FROM cards WHERE id=? AND active=1", (source_card_id,)).fetchone()
+        if not card or card["player_id"] != account_id:
+            raise ValueError("Карта снятия не найдена или выключена.")
+        bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
+                                  COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
+                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
+                        (source_card_id, source_card_id)).fetchone()[0]
+        held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (source_card_id,)).fetchone()[0]
+        available = int(bal) - int(held)
+        if available < amount:
+            raise ValueError(f"Недостаточно свободных средств на карте. Доступно: {available} АР.")
+        cur = c.execute("""INSERT INTO withdrawal_requests(account_player,requester_player,source_card_id,amount,created_at)
+                          VALUES(?,?,?,?,?)""", (account_id, requester_id, source_card_id, amount, now()))
+        return cur.lastrowid
+
+
+def fulfill_withdrawal_request(request_id, banker_telegram_id):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        request = c.execute("""SELECT r.*,a.minecraft_name AS account_name,q.minecraft_name AS requester_name
+            FROM withdrawal_requests r JOIN players a ON a.id=r.account_player
+            JOIN players q ON q.id=r.requester_player WHERE r.id=? AND r.status='pending'""", (request_id,)).fetchone()
+        if not request:
+            raise ValueError("Заявка уже обработана или не найдена.")
+        account_id, amount = request["account_player"], request["amount"]
+        card_id = request["source_card_id"]
+        bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
+                                  COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
+                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
+                        (card_id, card_id)).fetchone()[0]
+        held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending' AND id<>?", (card_id, request_id)).fetchone()[0]
+        if int(bal) - int(held) < amount:
+            raise ValueError("Свободного баланса уже недостаточно для этой заявки.")
+        opening = c.execute("SELECT value FROM bank_meta WHERE key='starting_vault_ar'").fetchone()
+        cash_moves = c.execute("SELECT COALESCE(SUM(amount),0) FROM vault_events").fetchone()[0]
+        cash = int(opening["value"] if opening else 0) + int(cash_moves)
+        if cash < amount:
+            raise ValueError(f"В хранилище недостаточно АР. Доступно: {cash} АР.")
+        c.execute("""INSERT INTO ledger(kind,from_player,to_player,from_card_id,to_card_id,amount,actor_telegram_id,note,created_at)
+                     VALUES('withdraw',?,NULL,?,NULL,?,?,?,?)""",
+                  (account_id, card_id, amount, banker_telegram_id,
+                   f"Выдано по заявке #{request_id} игроку {request['requester_name']}", now()))
+        c.execute("INSERT INTO vault_events(amount,kind,actor_telegram_id,created_at) VALUES(?,?,?,?)",
+                  (-amount, "withdraw", banker_telegram_id, now()))
+        c.execute("UPDATE withdrawal_requests SET status='completed',closed_at=?,banker_telegram_id=? WHERE id=?",
+                  (now(), banker_telegram_id, request_id))
+        return dict(request)
+
+
+def reject_withdrawal_request(request_id, banker_telegram_id):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        request = c.execute("""SELECT r.*,a.minecraft_name AS account_name,q.minecraft_name AS requester_name
+            FROM withdrawal_requests r JOIN players a ON a.id=r.account_player
+            JOIN players q ON q.id=r.requester_player WHERE r.id=? AND r.status='pending'""", (request_id,)).fetchone()
+        if not request:
+            raise ValueError("Заявка уже обработана или не найдена.")
+        c.execute("UPDATE withdrawal_requests SET status='rejected',closed_at=?,banker_telegram_id=? WHERE id=?",
+                  (now(), banker_telegram_id, request_id))
+        return dict(request)
 
 
 def begin_state(tid, mode):
@@ -284,11 +475,39 @@ def begin_state(tid, mode):
 
 def parse_amount(value):
     if not value.isdigit() or int(value) <= 0:
-        raise ValueError("Введи положительное целое число AR.")
+        raise ValueError("Введи положительное целое число АР.")
     return int(value)
 
 
 STATES = {}
+
+
+def start_user_operation(chat_id, tid, player, mode):
+    accounts = accessible_accounts(player["id"])
+    if not accounts:
+        send(chat_id, "Нет активных карт. Сначала выпусти карту в разделе «Баланс и карты».", menu(tid, show_home=True))
+        return
+    if len(accounts) > 1:
+        STATES[tid] = {"mode": mode, "step": "source"}
+        rows = []
+        for account in accounts:
+            if account["owner_name"] is None:
+                label = f"Моя карта {account['card_number']} · {available_balance(account['card_id'])} АР"
+            else:
+                label = f"{account['card_number']} · {account['owner_name']}"
+            rows.append([(label, f"useaccount:{mode}:{account['account_id']}:{account['card_id'] or 0}")])
+        rows.append([("🏠 Главное меню", "home")])
+        send(chat_id, "Выбери счёт, с которого выполнить операцию:", keyboard(rows))
+        return
+
+    source = accounts[0]
+    STATES[tid] = {"mode": mode, "step": "target" if mode == "transfer" else "amount",
+                   "source_player": source["account_id"], "source_card_id": source["card_id"],
+                   "source_card_number": source["card_number"]}
+    if mode == "transfer":
+        send(chat_id, "Введи Minecraft ник получателя или номер его карты. /cancel — отмена.", home_markup())
+    else:
+        send(chat_id, "Введи целую сумму АР для заявки на снятие. Банкир подтвердит её при выдаче наличных.", home_markup())
 
 
 def on_message(message):
@@ -357,18 +576,45 @@ def on_message(message):
             send(chat_id, f"Аккаунт {text} создан. Твоя первая карта: {card}\n\nДля тестовой версии привязка по нику не защищена от чужой регистрации. Пока не выдавай на такие аккаунты реальные ценности.", menu(tid))
             return
 
+        if mode == "share" and step == "recipient":
+            recipient = player_by_name(text)
+            if not recipient:
+                raise ValueError("Игрок не найден. Он должен сначала зарегистрироваться в боте.")
+            if recipient["id"] == player["id"]:
+                raise ValueError("Нельзя делиться картой с самим собой.")
+            with db() as c:
+                card = c.execute("SELECT id,number FROM cards WHERE id=? AND player_id=? AND active=1",
+                                  (state["card_id"], player["id"])).fetchone()
+                if not card:
+                    raise ValueError("Твоя карта не найдена или уже отключена.")
+                c.execute("INSERT OR IGNORE INTO card_access(card_id,player_id,granted_by,created_at) VALUES(?,?,?,?)",
+                          (card["id"], recipient["id"], player["id"], now()))
+            STATES.pop(tid, None)
+            send(chat_id, f"Доступ к карте {card['number']} выдан игроку {recipient['minecraft_name']}. Он сможет переводить и запрашивать снятие только с баланса этой карты.", menu(tid, show_home=True))
+            return
+
         if mode == "transfer" and step == "target":
             target = player_by_name_or_card(text)
-            if not target or target["id"] == player["id"]:
-                raise ValueError("Не нашёл другого игрока по нику или номеру карты.")
+            if not target:
+                raise ValueError("Не нашёл игрока или карту.")
             if re.fullmatch(r"\d{5}", text):
-                state.update(target=target["id"], target_name=target["minecraft_name"], step="amount")
-                send(chat_id, f"Перевод на карту {text} игрока {target['minecraft_name']}. Введи целую сумму AR.", home_markup())
+                with db() as c:
+                    card = c.execute("SELECT id,number FROM cards WHERE player_id=? AND number=? AND active=1", (target["id"], text)).fetchone()
+                if not card:
+                    raise ValueError("Карта не найдена или выключена.")
+                if card["id"] == state.get("source_card_id"):
+                    raise ValueError("Нельзя переводить с карты на неё же.")
+                state.update(target=target["id"], target_name=target["minecraft_name"], target_card=text,
+                             target_card_id=card["id"], step="amount")
+                send(chat_id, f"Перевод на карту {text} игрока {target['minecraft_name']}. Введи целую сумму АР.", home_markup())
                 return
             with db() as c:
                 cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (target["id"],)).fetchall()
             if not cards:
                 raise ValueError("У игрока пока нет активной карты.")
+            cards = [card for card in cards if card["id"] != state.get("source_card_id")]
+            if not cards:
+                raise ValueError("У игрока нет другой карты для перевода.")
             state.update(target=target["id"], target_name=target["minecraft_name"], step="pick_card")
             rows = [[(card["number"], f"pickcard:{card['id']}")] for card in cards]
             rows.append([("🏠 Главное меню", "home")])
@@ -381,26 +627,54 @@ def on_message(message):
             target = player_by_name_or_card(text)
             if not target:
                 raise ValueError("Игрок или карта не найдены.")
-            state.update(target=target["id"], target_name=target["minecraft_name"], step="amount")
-            send(chat_id, f"Игрок: {target['minecraft_name']}. Введи целую сумму AR.", home_markup())
+            with db() as c:
+                if re.fullmatch(r"\d{5}", text):
+                    cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND number=? AND active=1", (target["id"], text)).fetchall()
+                else:
+                    cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (target["id"],)).fetchall()
+            if not cards:
+                raise ValueError("У игрока нет активных карт.")
+            if len(cards) == 1:
+                state.update(target=target["id"], target_name=target["minecraft_name"], target_card_id=cards[0]["id"], target_card_number=cards[0]["number"], step="amount")
+                send(chat_id, f"Карта {cards[0]['number']} игрока {target['minecraft_name']}. Введи целую сумму АР.", home_markup())
+            else:
+                state.update(target=target["id"], target_name=target["minecraft_name"], step="select_bank_card")
+                rows = [[(f"{card['number']} · баланс {balance(card['id'])} АР", f"bankcard:{mode}:{card['id']}")] for card in cards]
+                rows.append([("🏠 Главное меню", "home")])
+                send(chat_id, f"Выбери карту игрока {target['minecraft_name']}:", keyboard(rows))
             return
 
         if step == "amount":
             amount = parse_amount(text)
             if mode == "transfer":
-                op = record("transfer", player["id"], state["target"], amount, tid,
-                            f"На карту {state.get('target_card', 'выбрана по нику')}")
-                send(chat_id, f"Готово: переведено {amount} AR игроку {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
+                source_player_id = state.get("source_player", player["id"])
+                if not can_use_account(player["id"], source_player_id, state.get("source_card_id")):
+                    raise ValueError("Доступ к выбранной карте закрыт.")
+                source_note = f"Доступ к карте {state['source_card_number']}; действовал {player['minecraft_name']}" if source_player_id != player["id"] else ""
+                card_note = f"На карту {state['target_card']}" if state.get("target_card") else "Получатель выбран по нику"
+                note = f"{card_note}; {source_note}" if source_note else card_note
+                op = record("transfer", source_player_id, state["target"], amount, tid, note,
+                            from_card_id=state["source_card_id"], to_card_id=state["target_card_id"])
+                send(chat_id, f"Готово: переведено {amount} АР на карту {state['target_card']} игрока {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
+                notify_card_users(state["target_card_id"],
+                                  f"🔔 На карту {state['target_card']} поступило {amount} АР от игрока {player['minecraft_name']}.\nОперация #{op}. Баланс карты: {balance(state['target_card_id'])} АР.",
+                                  exclude_telegram_id=tid)
+            elif mode == "withdraw_request":
+                source_player_id = state.get("source_player", player["id"])
+                if not can_use_account(player["id"], source_player_id, state.get("source_card_id")):
+                    raise ValueError("Доступ к выбранной карте закрыт.")
+                request_id = create_withdrawal_request(source_player_id, player["id"], state.get("source_card_id"), amount)
+                send(chat_id, f"Заявка на снятие {amount} АР с карты {state['source_card_number']} создана под номером #{request_id}. Банкир подтвердит выдачу наличных.", menu(tid, show_home=True))
             elif mode == "deposit":
-                op = record("deposit", None, state["target"], amount, tid, "Наличные AR сданы в кассу банка")
-                send(chat_id, f"Зачислено {amount} AR игроку {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
-                with db() as c:
-                    recipient = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?", (state["target"],)).fetchone()
-                if recipient:
-                    send(recipient["telegram_id"], f"На твой счёт внесено {amount} AR. Операция #{op}.")
+                op = record("deposit", None, state["target"], amount, tid, "Наличные АР сданы в кассу банка",
+                            to_card_id=state["target_card_id"])
+                send(chat_id, f"Зачислено {amount} АР на карту {state['target_card_number']} игрока {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
+                notify_card_users(state["target_card_id"],
+                                  f"На карту {state['target_card_number']} внесено {amount} АР. Баланс карты: {balance(state['target_card_id'])} АР. Операция #{op}.")
             elif mode == "withdraw":
-                op = record("withdraw", state["target"], None, amount, tid, "Наличные AR выданы из хранилища банка")
-                send(chat_id, f"Снято {amount} AR со счёта {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
+                op = record("withdraw", state["target"], None, amount, tid, "Наличные АР выданы из хранилища банка",
+                            from_card_id=state["target_card_id"])
+                send(chat_id, f"Снято {amount} АР с карты {state['target_card_number']} игрока {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
             STATES.pop(tid, None)
             return
     except (ValueError, sqlite3.IntegrityError) as e:
@@ -415,14 +689,96 @@ def on_callback(query):
     answer_callback(query["id"])
     if data == "account" and player:
         with db() as c:
-            cards = c.execute("SELECT number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (player["id"],)).fetchall()
-        card_lines = "\n".join("• " + r["number"] for r in cards) or "Карт нет"
+            cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (player["id"],)).fetchall()
+            shares = c.execute("""SELECT a.card_id,k.number,p.id AS player_id,p.minecraft_name
+                FROM card_access a JOIN cards k ON k.id=a.card_id JOIN players p ON p.id=a.player_id
+                WHERE k.player_id=? AND k.active=1 ORDER BY k.number,p.minecraft_name""", (player["id"],)).fetchall()
+        shares_by_card = {}
+        for share in shares:
+            shares_by_card.setdefault(share["card_id"], []).append(share)
+        card_lines = "\n".join(
+            f"• {card['number']} — {balance(card['id'])} АР (доступно {available_balance(card['id'])} АР)" +
+            (" — доступ: " + ", ".join(s["minecraft_name"] for s in shares_by_card.get(card["id"], []))
+             if shares_by_card.get(card["id"]) else "")
+            for card in cards) or "Карт нет"
+        received_cards = shared_cards(player["id"])
+        if received_cards:
+            card_lines += "\n\nДоступные тебе карты:\n" + "\n".join(
+                f"• {row['number']} — {row['owner_name']}: {balance(row['card_id'])} АР (доступно {available_balance(row['card_id'])} АР)"
+                for row in received_cards)
         rows = [[("➕ Выпустить карту", "newcard")]] if len(cards) < 5 else []
+        if cards:
+            rows.append([("🔗 Поделиться картой", "share")])
+            for card in cards:
+                rows.append([(f"🗑 Удалить {card['number']}", f"deletecard:{card['id']}")])
+        for share in shares:
+            rows.append([(f"✖ {share['number']} → {share['minecraft_name']}", f"revoke:{share['card_id']}:{share['player_id']}")])
         rows.append([("🏠 Главное меню", "home")])
-        send(chat_id, f"Игрок: {player['minecraft_name']}\nБаланс: {balance(player['id'])} AR\nКарты:\n{card_lines}", keyboard(rows))
+        send(chat_id, f"Игрок: {player['minecraft_name']}\nВсего на своих картах: {player_balance(player['id'])} АР\nКарты:\n{card_lines}", keyboard(rows))
     elif data == "newcard" and player:
         card = issue_card(player["id"])
         send(chat_id, f"Выпущена новая карта: {card}" if card else "У тебя уже максимум — пять карт.", menu(tid, show_home=True))
+    elif data.startswith("deletecard:") and player:
+        try:
+            card_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        with db() as c:
+            card = c.execute("SELECT id,number FROM cards WHERE id=? AND player_id=? AND active=1", (card_id, player["id"])).fetchone()
+        if not card:
+            send(chat_id, "Карта не найдена или уже удалена.", menu(tid, show_home=True))
+            return
+        card_balance = balance(card_id)
+        if card_balance != 0:
+            send(chat_id, f"На карте {card_balance} АР. Сначала переведи остаток на другую карту, потом удаляй.", menu(tid, show_home=True))
+            return
+        if pending_withdrawals(card_id) > 0:
+            send(chat_id, "По этой карте есть ожидающая заявка на снятие. Дождись её обработки.", menu(tid, show_home=True))
+            return
+        with db() as c:
+            c.execute("UPDATE cards SET active=0 WHERE id=?", (card_id,))
+            c.execute("DELETE FROM card_access WHERE card_id=?", (card_id,))
+        send(chat_id, f"Карта {card['number']} удалена.", menu(tid, show_home=True))
+    elif data == "share" and player:
+        with db() as c:
+            cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (player["id"],)).fetchall()
+        if not cards:
+            send(chat_id, "У тебя пока нет активных карт.", menu(tid, show_home=True))
+            return
+        STATES[tid] = {"mode": "share", "step": "select_card"}
+        rows = [[(card["number"], f"sharecard:{card['id']}")] for card in cards]
+        rows.append([("🏠 Главное меню", "home")])
+        send(chat_id, "Выбери карту, к которой хочешь открыть доступ:", keyboard(rows))
+    elif data.startswith("sharecard:") and player:
+        state = STATES.get(tid)
+        if not state or state.get("mode") != "share" or state.get("step") != "select_card":
+            return
+        card_id = int(data.split(":", 1)[1])
+        with db() as c:
+            card = c.execute("SELECT id,number FROM cards WHERE id=? AND player_id=? AND active=1", (card_id, player["id"])).fetchone()
+        if not card:
+            STATES.pop(tid, None)
+            send(chat_id, "Карта не найдена.", menu(tid, show_home=True))
+            return
+        state.update(step="recipient", card_id=card_id)
+        send(chat_id, f"Введи Minecraft ник игрока, которому открыть доступ к карте {card['number']}.", home_markup())
+    elif data.startswith("revoke:") and player:
+        try:
+            _, card_id, recipient_id = data.split(":", 2)
+            card_id, recipient_id = int(card_id), int(recipient_id)
+        except ValueError:
+            return
+        with db() as c:
+            owned_share = c.execute("""SELECT 1 FROM card_access a JOIN cards k ON k.id=a.card_id
+                WHERE a.card_id=? AND a.player_id=? AND a.granted_by=? AND k.player_id=?""",
+                                     (card_id, recipient_id, player["id"], player["id"])).fetchone()
+            if not owned_share:
+                send(chat_id, "Не нашёл такую открытую тобой карту.", menu(tid, show_home=True))
+                return
+            c.execute("UPDATE withdrawal_requests SET status='rejected',closed_at=? WHERE source_card_id=? AND requester_player=? AND status='pending'",
+                      (now(), card_id, recipient_id))
+            c.execute("DELETE FROM card_access WHERE card_id=? AND player_id=?", (card_id, recipient_id))
+        send(chat_id, "Доступ к карте закрыт.", menu(tid, show_home=True))
     elif data in ("home", "back"):
         STATES.pop(tid, None)
         send(chat_id, "Главное меню:", menu(tid))
@@ -436,6 +792,8 @@ def on_callback(query):
             c.execute("BEGIN IMMEDIATE")
             c.execute("DELETE FROM ledger")
             c.execute("DELETE FROM vault_events")
+            c.execute("DELETE FROM withdrawal_requests")
+            c.execute("DELETE FROM card_access")
             c.execute("DELETE FROM cards")
             c.execute("DELETE FROM telegram_users")
             c.execute("DELETE FROM players")
@@ -452,20 +810,98 @@ def on_callback(query):
             STATES.pop(tid, None)
             send(chat_id, "Эта карта больше недоступна. Начни перевод заново.", menu(tid, show_home=True))
             return
-        state.update(step="amount", target_card=card["number"])
-        send(chat_id, f"Перевод на карту {card['number']} игрока {state['target_name']}. Введи целую сумму AR.", home_markup())
+        state.update(step="amount", target_card=card["number"], target_card_id=card_id)
+        send(chat_id, f"Перевод на карту {card['number']} игрока {state['target_name']}. Введи целую сумму АР.", home_markup())
     elif data == "transfer" and player:
-        begin_state(tid, "transfer")
-        send(chat_id, "Введи Minecraft ник получателя или номер его карты. /cancel — отмена.", home_markup())
+        start_user_operation(chat_id, tid, player, "transfer")
+    elif data == "withdraw_request" and player:
+        start_user_operation(chat_id, tid, player, "withdraw_request")
+    elif data.startswith("useaccount:") and player:
+        try:
+            _, mode, account_id, card_id = data.split(":", 3)
+            account_id, card_id = int(account_id), int(card_id)
+            card_id = card_id or None
+        except ValueError:
+            return
+        if mode not in ("transfer", "withdraw_request") or not can_use_account(player["id"], account_id, card_id):
+            send(chat_id, "У тебя больше нет доступа к этому счёту.", menu(tid))
+            return
+        state = {"mode": mode, "source_player": account_id, "source_card_id": card_id}
+        if card_id:
+            with db() as c:
+                row = c.execute("SELECT number FROM cards WHERE id=?", (card_id,)).fetchone()
+            state["source_card_number"] = row["number"] if row else ""
+        state["step"] = "target" if mode == "transfer" else "amount"
+        STATES[tid] = state
+        prompt = "Введи Minecraft ник получателя или номер его карты." if mode == "transfer" else "Введи целую сумму АР для заявки на снятие. Банкир подтвердит её при выдаче наличных."
+        send(chat_id, prompt, home_markup())
     elif data == "history" and player:
-        send(chat_id, history_text(player["id"]), menu(tid, show_home=True))
+        send(chat_id, history_text(player["id"], tid), menu(tid, show_home=True))
     elif data in ("deposit", "withdraw") and has_permission(tid, "banker"):
         begin_state(tid, data)
         send(chat_id, "Введи Minecraft ник игрока или номер карты. /cancel — отмена.", home_markup())
+    elif data.startswith("bankcard:") and has_permission(tid, "banker"):
+        state = STATES.get(tid)
+        if not state or state.get("step") != "select_bank_card":
+            return
+        _, mode, raw_card_id = data.split(":", 2)
+        card_id = int(raw_card_id)
+        if mode != state.get("mode"):
+            return
+        with db() as c:
+            card = c.execute("SELECT id,number,player_id FROM cards WHERE id=? AND player_id=? AND active=1",
+                              (card_id, state["target"])).fetchone()
+        if not card:
+            send(chat_id, "Карта больше не активна.", menu(tid, show_home=True))
+            STATES.pop(tid, None)
+            return
+        state.update(step="amount", target_card_id=card_id, target_card_number=card["number"])
+        send(chat_id, f"Карта {card['number']} игрока {state['target_name']}. Введи целую сумму АР.", home_markup())
+    elif data == "withdraw_requests" and has_permission(tid, "banker"):
+        with db() as c:
+            requests = c.execute("""SELECT r.id,r.amount,a.minecraft_name AS account_name,q.minecraft_name AS requester_name
+                FROM withdrawal_requests r JOIN players a ON a.id=r.account_player
+                JOIN players q ON q.id=r.requester_player WHERE r.status='pending' ORDER BY r.id LIMIT 25""").fetchall()
+        if not requests:
+            send(chat_id, "Ожидающих заявок на снятие нет.", menu(tid, show_home=True))
+        else:
+            request_text = "Ожидающие заявки (АР уже зарезервированы):\n" + "\n".join(
+                f"#{r['id']} · {r['requester_name']} просит {r['amount']} АР с карты {r['account_name']}"
+                for r in requests)
+            rows = []
+            for request in requests:
+                rows.append([(f"✅ Выдано #{request['id']}", f"wdapprove:{request['id']}"),
+                             (f"❌ Отказать #{request['id']}", f"wdreject:{request['id']}")])
+            rows.append([("🏠 Главное меню", "home")])
+            send(chat_id, request_text, keyboard(rows))
+    elif data.startswith("wdapprove:") and has_permission(tid, "banker"):
+        request_id = int(data.split(":", 1)[1])
+        try:
+            request = fulfill_withdrawal_request(request_id, tid)
+            notify_card_users(request["source_card_id"],
+                              f"✅ Банкир выдал {request['amount']} АР по заявке #{request_id}. Баланс карты: {balance(request['source_card_id'])} АР.")
+            send(chat_id, f"Заявка #{request_id} закрыта: выдано {request['amount']} АР.", menu(tid, show_home=True))
+        except ValueError as exc:
+            send(chat_id, str(exc), menu(tid, show_home=True))
+    elif data.startswith("wdreject:") and has_permission(tid, "banker"):
+        request_id = int(data.split(":", 1)[1])
+        try:
+            request = reject_withdrawal_request(request_id, tid)
+            notify_card_users(request["source_card_id"],
+                              f"Заявка на снятие #{request_id} отклонена. Зарезервированные {request['amount']} АР снова доступны на карте.")
+            send(chat_id, f"Заявка #{request_id} отклонена.", menu(tid, show_home=True))
+        except ValueError as exc:
+            send(chat_id, str(exc), menu(tid, show_home=True))
     elif data == "summary" and has_permission(tid, "view_ledger"):
-        send(chat_id, f"Игроков: {player_count()}\nAR на счетах: {total_balances()}\nAR в хранилище: {vault_cash()}\nВсе операции хранятся в журнале.", menu(tid, show_home=True))
+        send(chat_id, f"Игроков: {player_count()}\nАР на картах: {total_balances()}\nАР в хранилище: {vault_cash()}\nВсе операции хранятся в журнале.", menu(tid, show_home=True))
     elif data == "ledger" and has_permission(tid, "view_ledger"):
         send(chat_id, global_history_text(), menu(tid, show_home=True))
+    elif data == "players" and has_permission(tid, "view_ledger"):
+        report = players_report_text()
+        chunks = split_message(report)
+        for index, chunk in enumerate(chunks):
+            markup = menu(tid, show_home=True) if index == len(chunks) - 1 else None
+            send(chat_id, chunk, markup)
 
 
 def player_count():
@@ -480,8 +916,49 @@ def global_history_text():
             ORDER BY l.id DESC LIMIT 20""").fetchall()
     if not rows:
         return "В журнале пока нет операций."
-    lines = [f"#{r['id']} {r['kind']} · {r['sender'] or 'касса'} → {r['receiver'] or 'касса'} · {r['amount']} AR" + (f" · {r['note']}" if r['note'] else "") for r in rows]
+    lines = [f"#{r['id']} {r['kind']} · {r['sender'] or 'касса'} → {r['receiver'] or 'касса'} · {r['amount']} АР" + (f" · {r['note']}" if r['note'] else "") for r in rows]
     return "Последние операции банка:\n" + "\n".join(lines)
+
+
+def players_report_text():
+    with db() as c:
+        players = c.execute("SELECT id,minecraft_name FROM players ORDER BY minecraft_name COLLATE NOCASE").fetchall()
+        all_cards = c.execute("SELECT id,player_id,number FROM cards WHERE active=1 ORDER BY player_id,id").fetchall()
+    cards_by_player = {}
+    for card in all_cards:
+        cards_by_player.setdefault(card["player_id"], []).append(card)
+
+    lines = [
+        "📊 Реестр банка",
+        f"Игроков: {len(players)}",
+        f"Активных карт: {len(all_cards)}",
+        f"АР на картах: {total_balances()}",
+        f"АР в хранилище: {vault_cash()}",
+        "",
+    ]
+    if not players:
+        lines.append("Зарегистрированных игроков пока нет.")
+    else:
+        for player in players:
+            player_cards = cards_by_player.get(player["id"], [])
+            card_text = ", ".join(f"{card['number']}: {balance(card['id'])} АР" for card in player_cards) or "нет активных карт"
+            lines.append(f"{player['minecraft_name']} — всего {player_balance(player['id'])} АР\nКарты: {card_text}")
+    return "\n".join(lines)
+
+
+def split_message(text, limit=3600):
+    chunks = []
+    current = ""
+    for part in text.split("\n"):
+        candidate = f"{current}\n{part}" if current else part
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = part
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def main():

@@ -8,6 +8,7 @@ import sqlite3
 import time
 import urllib.parse
 import urllib.request
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -33,6 +34,13 @@ if not TOKEN:
 
 API = f"https://api.telegram.org/bot{TOKEN}/"
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
+MAX_AMOUNT = 2_147_483_647
+MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
+RATE_LIMIT_PER_MINUTE = 30
+RESET_CONFIRMATION = "Да, я знаю, что делаю"
+REQUEST_TIMES = defaultdict(deque)
+RATE_NOTICE_AT = {}
+LAST_RATE_PRUNE = 0
 
 
 @contextmanager
@@ -130,11 +138,13 @@ def init_db():
                      WHERE to_player IS NOT NULL AND to_card_id IS NULL""")
         c.execute("""UPDATE withdrawal_requests SET source_card_id=(SELECT MIN(id) FROM cards WHERE player_id=withdrawal_requests.account_player)
                      WHERE source_card_id IS NULL""")
+        # Legacy request-based withdrawals are retired; release any old reserved balances.
+        c.execute("UPDATE withdrawal_requests SET status='rejected',closed_at=? WHERE status='pending'", (datetime.now(timezone.utc).isoformat(),))
         if STARTING_VAULT.isdigit():
             c.execute("INSERT OR IGNORE INTO bank_meta(key,value) VALUES('starting_vault_ar',?)", (STARTING_VAULT,))
         for value in os.environ.get("BANK_ADMIN_IDS", "").split(","):
             value = value.strip()
-            if value.isdigit():
+            if re.fullmatch(r"[0-9]{1,19}", value) and 0 < int(value) <= MAX_SQLITE_INTEGER:
                 c.execute("INSERT OR IGNORE INTO roles(telegram_id,permission) VALUES(?, 'admin')", (int(value),))
 
 
@@ -174,6 +184,62 @@ def has_permission(tid, permission):
                          (tid, permission)).fetchone() is not None
 
 
+def valid_nickname(value):
+    return bool(USERNAME_RE.fullmatch(value)) and not re.fullmatch(r"[0-9]{5}", value)
+
+
+def valid_player_lookup(value):
+    return bool(re.fullmatch(r"[0-9]{5}", value) or valid_nickname(value))
+
+
+def allow_request(tid):
+    global LAST_RATE_PRUNE
+    current = time.monotonic()
+    if current - LAST_RATE_PRUNE >= 60:
+        for known_tid, history in list(REQUEST_TIMES.items()):
+            while history and current - history[0] >= 60:
+                history.popleft()
+            if not history:
+                REQUEST_TIMES.pop(known_tid, None)
+                RATE_NOTICE_AT.pop(known_tid, None)
+        LAST_RATE_PRUNE = current
+    requests = REQUEST_TIMES[tid]
+    while requests and current - requests[0] >= 60:
+        requests.popleft()
+    if len(requests) >= RATE_LIMIT_PER_MINUTE:
+        return False
+    requests.append(current)
+    return True
+
+
+def should_send_rate_notice(tid):
+    current = time.monotonic()
+    last_notice = RATE_NOTICE_AT.get(tid)
+    if last_notice is None or current - last_notice >= 60:
+        RATE_NOTICE_AT[tid] = current
+        return True
+    return False
+
+
+def prompt_reset_confirmation(chat_id, tid):
+    STATES[tid] = {"mode": "admin_reset", "step": "phrase", "created_at": time.monotonic()}
+    send(chat_id,
+         f"⚠️ Это удалит игроков, карты, балансы, историю и движения кассы.\n\nЧтобы подтвердить, отправь отдельным сообщением точно:\n{RESET_CONFIRMATION}",
+         keyboard([[('Отмена', 'reset_cancel')]]))
+
+
+def clear_test_data():
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM ledger")
+        c.execute("DELETE FROM vault_events")
+        c.execute("DELETE FROM withdrawal_requests")
+        c.execute("DELETE FROM card_access")
+        c.execute("DELETE FROM cards")
+        c.execute("DELETE FROM telegram_users")
+        c.execute("DELETE FROM players")
+
+
 def user_player(tid):
     with db() as c:
         row = c.execute("SELECT p.* FROM telegram_users t JOIN players p ON p.id=t.player_id WHERE t.telegram_id=?",
@@ -182,6 +248,8 @@ def user_player(tid):
 
 
 def player_by_name_or_card(value):
+    if not valid_player_lookup(value):
+        return None
     with db() as c:
         return c.execute("""SELECT p.* FROM players p
             LEFT JOIN cards k ON k.player_id=p.id AND k.active=1
@@ -190,6 +258,8 @@ def player_by_name_or_card(value):
 
 
 def player_by_name(value):
+    if not valid_nickname(value):
+        return None
     with db() as c:
         return c.execute("SELECT * FROM players WHERE minecraft_name=? COLLATE NOCASE", (value,)).fetchone()
 
@@ -301,7 +371,9 @@ def issue_card(player_id):
 
 
 def register(tid, name):
-    if not USERNAME_RE.fullmatch(name):
+    if not valid_nickname(name):
+        if re.fullmatch(r"[0-9]{5}", name):
+            raise ValueError("Ник из ровно пяти цифр нельзя использовать: он совпадает с форматом номера карты.")
         raise ValueError("Ник должен быть от 3 до 16 символов: латинские буквы, цифры или _.")
     with db() as c:
         if c.execute("SELECT 1 FROM telegram_users WHERE telegram_id=?", (tid,)).fetchone():
@@ -321,19 +393,48 @@ def add_role(tid, permission):
 
 def menu(tid, show_home=False):
     rows = [[("💳 Баланс и карты", "account"), ("↔️ Перевод", "transfer")],
-            [("📜 История", "history"), ("💸 Запросить снятие", "withdraw_request")]]
+            [("📜 История", "history")]]
     if has_permission(tid, "banker"):
         rows.append([("🏦 Внести АР", "deposit"), ("💸 Снять АР", "withdraw")])
-        rows.append([("📨 Заявки на снятие", "withdraw_requests")])
     if has_permission(tid, "view_ledger"):
-        rows.append([("📊 Сводка банка", "summary"), ("📚 Журнал банка", "ledger")])
+        rows.append([("📊 Сводка и журнал банка", "bank_report")])
         rows.append([("👥 Игроки и карты", "players")])
     if has_permission(tid, "admin"):
+        rows.append([("🛡 Управление банкирами", "manage_bankers")])
         rows.append([("🧹 Сбросить тестовую базу", "reset_prompt")])
     if show_home:
         rows.append([("🏠 Главное меню", "home")])
     send_menu = keyboard(rows)
     return send_menu
+
+
+def send_banker_management(chat_id, tid):
+    with db() as c:
+        players = c.execute("""WITH subjects AS (
+                SELECT t.telegram_id,p.minecraft_name FROM players p JOIN telegram_users t ON t.player_id=p.id
+                UNION SELECT r.telegram_id,NULL AS minecraft_name FROM roles r
+                    WHERE NOT EXISTS(SELECT 1 FROM telegram_users t WHERE t.telegram_id=r.telegram_id)
+            )
+            SELECT s.telegram_id,s.minecraft_name,
+                MAX(CASE WHEN r.permission='banker' THEN 1 ELSE 0 END) AS is_banker,
+                MAX(CASE WHEN r.permission='admin' THEN 1 ELSE 0 END) AS is_admin
+            FROM subjects s LEFT JOIN roles r ON r.telegram_id=s.telegram_id
+            GROUP BY s.telegram_id,s.minecraft_name
+            ORDER BY COALESCE(s.minecraft_name,CAST(s.telegram_id AS TEXT)) COLLATE NOCASE""").fetchall()
+    rows = []
+    for target in players:
+        display_name = target["minecraft_name"] or f"Telegram {target['telegram_id']}"
+        if target["is_admin"]:
+            rows.append([(f"👑 {display_name} — администратор", "noop")])
+        elif target["is_banker"]:
+            rows.append([(f"✅ {display_name} — снять роль банкира", f"banker_toggle:{target['telegram_id']}")])
+        else:
+            rows.append([(f"➕ {display_name} — сделать банкиром", f"banker_toggle:{target['telegram_id']}")])
+    rows.append([("🏠 Главное меню", "home")])
+    if not players:
+        send(chat_id, "Зарегистрированных игроков пока нет.", keyboard(rows))
+    else:
+        send(chat_id, "Управление ролью банкира. Администратор уже имеет все права.", keyboard(rows))
 
 
 def home_markup():
@@ -474,9 +575,12 @@ def begin_state(tid, mode):
 
 
 def parse_amount(value):
-    if not value.isdigit() or int(value) <= 0:
-        raise ValueError("Введи положительное целое число АР.")
-    return int(value)
+    if not re.fullmatch(r"[0-9]{1,10}", value):
+        raise ValueError("Введи целое положительное число АР не длиннее 10 цифр.")
+    amount = int(value)
+    if amount <= 0 or amount > MAX_AMOUNT:
+        raise ValueError(f"Сумма должна быть от 1 до {MAX_AMOUNT} АР.")
+    return amount
 
 
 STATES = {}
@@ -516,13 +620,20 @@ def on_message(message):
     chat_id = message["chat"]["id"]
     tid = message["from"]["id"]
     text = (message.get("text") or "").strip()
+    if len(text) > 256:
+        if STATES.get(tid, {}).get("mode") == "admin_reset":
+            STATES.pop(tid, None)
+        send(chat_id, "Сообщение слишком длинное. Максимум — 256 символов.")
+        return
     player = user_player(tid)
 
     if text.startswith("/start"):
+        if STATES.get(tid, {}).get("mode") == "admin_reset":
+            STATES.pop(tid, None)
         if player:
             send(chat_id, f"Йоу, {player['minecraft_name']}! Это банк сервера.\nВыбери действие:", menu(tid))
         else:
-            send(chat_id, "Йоу! Для тестовой версии введи свой Minecraft ник.\n\n⚠️ Сейчас привязка по нику временная и не подтверждает владение пиратским аккаунтом. Перед настоящими переводами добавим одноразовый код из игры через Paper-плагин.")
+            send(chat_id, "Йоу! Введи свой Minecraft ник для привязки к этому Telegram аккаунту. Банк доверяет введённому нику.")
             STATES[tid] = {"mode": "register", "step": "name"}
         return
 
@@ -531,12 +642,17 @@ def on_message(message):
         send(chat_id, "Действие отменено.", menu(tid) if player else None)
         return
 
+    if text.startswith("/") and STATES.get(tid, {}).get("mode") == "admin_reset":
+        STATES.pop(tid, None)
+
     if text.startswith("/setrole"):
         if not has_permission(tid, "admin"):
             send(chat_id, "Нет доступа.")
             return
         parts = text.split()
-        if len(parts) != 3 or parts[2] not in ("banker", "view_ledger", "admin"):
+        if (len(parts) != 3 or not re.fullmatch(r"[0-9]{1,19}", parts[1])
+                or int(parts[1]) <= 0 or int(parts[1]) > MAX_SQLITE_INTEGER
+                or parts[2] not in ("banker", "view_ledger", "admin")):
             send(chat_id, "Формат: /setrole TELEGRAM_ID banker|view_ledger|admin")
             return
         add_role(int(parts[1]), parts[2])
@@ -558,8 +674,7 @@ def on_message(message):
         if not has_permission(tid, "admin"):
             send(chat_id, "Нет доступа.")
             return
-        send(chat_id, "Сброс удалит всех тестовых игроков, карты, балансы, историю и движения хранилища. Роли доступа и начальный запас хранилища сохранятся.",
-             keyboard([[('⚠️ Подтвердить сброс', 'reset_confirm')], [('Отмена', 'reset_cancel')]]))
+        prompt_reset_confirmation(chat_id, tid)
         return
 
     state = STATES.get(tid)
@@ -569,11 +684,34 @@ def on_message(message):
     mode, step = state["mode"], state["step"]
 
     try:
+        if mode in ("deposit", "withdraw") and not has_permission(tid, "banker"):
+            STATES.pop(tid, None)
+            send(chat_id, "Роль банкира больше не активна.", menu(tid))
+            return
+
+        if mode == "admin_reset" and step == "phrase":
+            if not has_permission(tid, "admin"):
+                STATES.pop(tid, None)
+                send(chat_id, "Нет доступа администратора.")
+                return
+            if time.monotonic() - state.get("created_at", 0) > 120:
+                STATES.pop(tid, None)
+                send(chat_id, "Подтверждение сброса истекло. База не удалена.", menu(tid))
+                return
+            if text != RESET_CONFIRMATION:
+                STATES.pop(tid, None)
+                send(chat_id, "Фраза не совпала. База не удалена.", menu(tid))
+                return
+            clear_test_data()
+            STATES.clear()
+            send(chat_id, "Тестовая база очищена: аккаунты, карты, балансы и история удалены. Роли сохранены.", menu(tid))
+            return
+
         if mode == "register" and step == "name":
             pid = register(tid, text)
             card = issue_card(pid)
             STATES.pop(tid, None)
-            send(chat_id, f"Аккаунт {text} создан. Твоя первая карта: {card}\n\nДля тестовой версии привязка по нику не защищена от чужой регистрации. Пока не выдавай на такие аккаунты реальные ценности.", menu(tid))
+            send(chat_id, f"Аккаунт {text} привязан к этому Telegram. Твоя первая карта: {card}", menu(tid))
             return
 
         if mode == "share" and step == "recipient":
@@ -659,12 +797,6 @@ def on_message(message):
                 notify_card_users(state["target_card_id"],
                                   f"🔔 На карту {state['target_card']} поступило {amount} АР от игрока {player['minecraft_name']}.\nОперация #{op}. Баланс карты: {balance(state['target_card_id'])} АР.",
                                   exclude_telegram_id=tid)
-            elif mode == "withdraw_request":
-                source_player_id = state.get("source_player", player["id"])
-                if not can_use_account(player["id"], source_player_id, state.get("source_card_id")):
-                    raise ValueError("Доступ к выбранной карте закрыт.")
-                request_id = create_withdrawal_request(source_player_id, player["id"], state.get("source_card_id"), amount)
-                send(chat_id, f"Заявка на снятие {amount} АР с карты {state['source_card_number']} создана под номером #{request_id}. Банкир подтвердит выдачу наличных.", menu(tid, show_home=True))
             elif mode == "deposit":
                 op = record("deposit", None, state["target"], amount, tid, "Наличные АР сданы в кассу банка",
                             to_card_id=state["target_card_id"])
@@ -782,23 +914,40 @@ def on_callback(query):
     elif data in ("home", "back"):
         STATES.pop(tid, None)
         send(chat_id, "Главное меню:", menu(tid))
-    elif data == "reset_prompt" and has_permission(tid, "admin"):
-        send(chat_id, "Сброс удалит всех тестовых игроков, карты, балансы, историю и движения хранилища. Роли доступа и начальный запас хранилища сохранятся.",
-             keyboard([[('⚠️ Подтвердить сброс', 'reset_confirm')], [('Отмена', 'reset_cancel')]]))
-    elif data == "reset_cancel" and has_permission(tid, "admin"):
-        send(chat_id, "Сброс отменён.", menu(tid))
-    elif data == "reset_confirm" and has_permission(tid, "admin"):
+    elif data == "manage_bankers" and has_permission(tid, "admin"):
+        send_banker_management(chat_id, tid)
+    elif data == "noop" and has_permission(tid, "admin"):
+        send(chat_id, "Администратор уже имеет все права.", menu(tid, show_home=True))
+    elif data.startswith("banker_toggle:") and has_permission(tid, "admin"):
+        raw_player_id = data.split(":", 1)[1]
+        if (not re.fullmatch(r"[0-9]{1,19}", raw_player_id)
+                or int(raw_player_id) <= 0 or int(raw_player_id) > MAX_SQLITE_INTEGER):
+            send(chat_id, "Некорректный игрок.", menu(tid, show_home=True))
+            return
+        target_telegram_id = int(raw_player_id)
         with db() as c:
-            c.execute("BEGIN IMMEDIATE")
-            c.execute("DELETE FROM ledger")
-            c.execute("DELETE FROM vault_events")
-            c.execute("DELETE FROM withdrawal_requests")
-            c.execute("DELETE FROM card_access")
-            c.execute("DELETE FROM cards")
-            c.execute("DELETE FROM telegram_users")
-            c.execute("DELETE FROM players")
-        STATES.clear()
-        send(chat_id, "Тестовая база очищена: аккаунты, карты, балансы и история удалены. Роли сохранены.", menu(tid))
+            target = c.execute("""SELECT
+                    (EXISTS(SELECT 1 FROM telegram_users WHERE telegram_id=?) OR
+                     EXISTS(SELECT 1 FROM roles WHERE telegram_id=?)) AS known_user,
+                    EXISTS(SELECT 1 FROM roles WHERE telegram_id=? AND permission='admin') AS is_admin,
+                    EXISTS(SELECT 1 FROM roles WHERE telegram_id=? AND permission='banker') AS is_banker""",
+                               (target_telegram_id, target_telegram_id, target_telegram_id, target_telegram_id)).fetchone()
+            if not target["known_user"]:
+                send(chat_id, "Аккаунт уже не зарегистрирован и не имеет ролей.", menu(tid, show_home=True))
+                return
+            if target["is_admin"]:
+                send(chat_id, "Администратор уже имеет все права; отдельное переключение роли банкира не требуется.", menu(tid, show_home=True))
+                return
+            if target["is_banker"]:
+                c.execute("DELETE FROM roles WHERE telegram_id=? AND permission='banker'", (target_telegram_id,))
+            else:
+                c.execute("INSERT OR IGNORE INTO roles(telegram_id,permission) VALUES(?,'banker')", (target_telegram_id,))
+        send_banker_management(chat_id, tid)
+    elif data == "reset_prompt" and has_permission(tid, "admin"):
+        prompt_reset_confirmation(chat_id, tid)
+    elif data == "reset_cancel" and has_permission(tid, "admin"):
+        STATES.pop(tid, None)
+        send(chat_id, "Сброс отменён.", menu(tid))
     elif data.startswith("pickcard:") and player:
         state = STATES.get(tid)
         if not state or state.get("mode") != "transfer" or state.get("step") != "pick_card":
@@ -814,8 +963,6 @@ def on_callback(query):
         send(chat_id, f"Перевод на карту {card['number']} игрока {state['target_name']}. Введи целую сумму АР.", home_markup())
     elif data == "transfer" and player:
         start_user_operation(chat_id, tid, player, "transfer")
-    elif data == "withdraw_request" and player:
-        start_user_operation(chat_id, tid, player, "withdraw_request")
     elif data.startswith("useaccount:") and player:
         try:
             _, mode, account_id, card_id = data.split(":", 3)
@@ -823,7 +970,7 @@ def on_callback(query):
             card_id = card_id or None
         except ValueError:
             return
-        if mode not in ("transfer", "withdraw_request") or not can_use_account(player["id"], account_id, card_id):
+        if mode != "transfer" or not can_use_account(player["id"], account_id, card_id):
             send(chat_id, "У тебя больше нет доступа к этому счёту.", menu(tid))
             return
         state = {"mode": mode, "source_player": account_id, "source_card_id": card_id}
@@ -831,10 +978,9 @@ def on_callback(query):
             with db() as c:
                 row = c.execute("SELECT number FROM cards WHERE id=?", (card_id,)).fetchone()
             state["source_card_number"] = row["number"] if row else ""
-        state["step"] = "target" if mode == "transfer" else "amount"
+        state["step"] = "target"
         STATES[tid] = state
-        prompt = "Введи Minecraft ник получателя или номер его карты." if mode == "transfer" else "Введи целую сумму АР для заявки на снятие. Банкир подтвердит её при выдаче наличных."
-        send(chat_id, prompt, home_markup())
+        send(chat_id, "Введи Minecraft ник получателя или номер его карты.", home_markup())
     elif data == "history" and player:
         send(chat_id, history_text(player["id"], tid), menu(tid, show_home=True))
     elif data in ("deposit", "withdraw") and has_permission(tid, "banker"):
@@ -857,45 +1003,13 @@ def on_callback(query):
             return
         state.update(step="amount", target_card_id=card_id, target_card_number=card["number"])
         send(chat_id, f"Карта {card['number']} игрока {state['target_name']}. Введи целую сумму АР.", home_markup())
-    elif data == "withdraw_requests" and has_permission(tid, "banker"):
-        with db() as c:
-            requests = c.execute("""SELECT r.id,r.amount,a.minecraft_name AS account_name,q.minecraft_name AS requester_name
-                FROM withdrawal_requests r JOIN players a ON a.id=r.account_player
-                JOIN players q ON q.id=r.requester_player WHERE r.status='pending' ORDER BY r.id LIMIT 25""").fetchall()
-        if not requests:
-            send(chat_id, "Ожидающих заявок на снятие нет.", menu(tid, show_home=True))
-        else:
-            request_text = "Ожидающие заявки (АР уже зарезервированы):\n" + "\n".join(
-                f"#{r['id']} · {r['requester_name']} просит {r['amount']} АР с карты {r['account_name']}"
-                for r in requests)
-            rows = []
-            for request in requests:
-                rows.append([(f"✅ Выдано #{request['id']}", f"wdapprove:{request['id']}"),
-                             (f"❌ Отказать #{request['id']}", f"wdreject:{request['id']}")])
-            rows.append([("🏠 Главное меню", "home")])
-            send(chat_id, request_text, keyboard(rows))
-    elif data.startswith("wdapprove:") and has_permission(tid, "banker"):
-        request_id = int(data.split(":", 1)[1])
-        try:
-            request = fulfill_withdrawal_request(request_id, tid)
-            notify_card_users(request["source_card_id"],
-                              f"✅ Банкир выдал {request['amount']} АР по заявке #{request_id}. Баланс карты: {balance(request['source_card_id'])} АР.")
-            send(chat_id, f"Заявка #{request_id} закрыта: выдано {request['amount']} АР.", menu(tid, show_home=True))
-        except ValueError as exc:
-            send(chat_id, str(exc), menu(tid, show_home=True))
-    elif data.startswith("wdreject:") and has_permission(tid, "banker"):
-        request_id = int(data.split(":", 1)[1])
-        try:
-            request = reject_withdrawal_request(request_id, tid)
-            notify_card_users(request["source_card_id"],
-                              f"Заявка на снятие #{request_id} отклонена. Зарезервированные {request['amount']} АР снова доступны на карте.")
-            send(chat_id, f"Заявка #{request_id} отклонена.", menu(tid, show_home=True))
-        except ValueError as exc:
-            send(chat_id, str(exc), menu(tid, show_home=True))
-    elif data == "summary" and has_permission(tid, "view_ledger"):
-        send(chat_id, f"Игроков: {player_count()}\nАР на картах: {total_balances()}\nАР в хранилище: {vault_cash()}\nВсе операции хранятся в журнале.", menu(tid, show_home=True))
-    elif data == "ledger" and has_permission(tid, "view_ledger"):
-        send(chat_id, global_history_text(), menu(tid, show_home=True))
+    elif data == "bank_report" and has_permission(tid, "view_ledger"):
+        report = (f"📊 Сводка банка\nИгроков: {player_count()}\nАР на картах: {total_balances()}\n"
+                  f"АР в хранилище: {vault_cash()}\n\n{global_history_text()}")
+        chunks = split_message(report)
+        for index, chunk in enumerate(chunks):
+            markup = menu(tid, show_home=True) if index == len(chunks) - 1 else None
+            send(chat_id, chunk, markup)
     elif data == "players" and has_permission(tid, "view_ledger"):
         report = players_report_text()
         chunks = split_message(report)
@@ -971,6 +1085,18 @@ def main():
             for update in updates:
                 offset = update["update_id"] + 1
                 try:
+                    inbound = update.get("message") or update.get("callback_query")
+                    if ("message" in update
+                            and update["message"].get("chat", {}).get("type") != "private"):
+                        continue
+                    telegram_user = inbound.get("from", {}) if inbound else {}
+                    telegram_id = telegram_user.get("id")
+                    if telegram_id is not None and not allow_request(telegram_id):
+                        if "callback_query" in update:
+                            answer_callback(update["callback_query"]["id"], "Лимит: не более 30 действий в минуту.")
+                        elif should_send_rate_notice(telegram_id):
+                            send(update["message"]["chat"]["id"], "Лимит: не более 30 действий в минуту. Попробуй чуть позже.")
+                        continue
                     if "message" in update:
                         on_message(update["message"])
                     elif "callback_query" in update:

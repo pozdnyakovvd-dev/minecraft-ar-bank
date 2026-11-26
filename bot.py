@@ -186,7 +186,7 @@ def issue_card(player_id):
         if c.execute("SELECT COUNT(*) FROM cards WHERE player_id=? AND active=1", (player_id,)).fetchone()[0] >= 5:
             return None
         while True:
-            number = "ARA" + "".join(str(secrets.randbelow(10)) for _ in range(9))
+            number = "".join(str(secrets.randbelow(10)) for _ in range(5))
             if not c.execute("SELECT 1 FROM cards WHERE number=?", (number,)).fetchone():
                 break
         c.execute("INSERT INTO cards(player_id,number,created_at) VALUES(?,?,?)", (player_id, number, now()))
@@ -212,15 +212,23 @@ def add_role(tid, permission):
         c.execute("INSERT OR IGNORE INTO roles(telegram_id,permission) VALUES(?,?)", (tid, permission))
 
 
-def menu(tid):
+def menu(tid, show_home=False):
     rows = [[("💳 Баланс и карты", "account"), ("↔️ Перевод", "transfer")],
             [("📜 История", "history")]]
     if has_permission(tid, "banker"):
         rows.append([("🏦 Внести AR", "deposit"), ("💸 Снять AR", "withdraw")])
     if has_permission(tid, "view_ledger"):
         rows.append([("📊 Сводка банка", "summary"), ("📚 Журнал банка", "ledger")])
+    if has_permission(tid, "admin"):
+        rows.append([("🧹 Сбросить тестовую базу", "reset_prompt")])
+    if show_home:
+        rows.append([("🏠 Главное меню", "home")])
     send_menu = keyboard(rows)
     return send_menu
+
+
+def home_markup():
+    return keyboard([[('🏠 Главное меню', 'home')]])
 
 
 def history_text(player_id):
@@ -324,7 +332,15 @@ def on_message(message):
         if not has_permission(tid, "view_ledger"):
             send(chat_id, "Нет доступа.")
             return
-        send(chat_id, global_history_text(), menu(tid))
+        send(chat_id, global_history_text(), menu(tid, show_home=True))
+        return
+
+    if text.startswith("/reset_test_data"):
+        if not has_permission(tid, "admin"):
+            send(chat_id, "Нет доступа.")
+            return
+        send(chat_id, "Сброс удалит всех тестовых игроков, карты, балансы, историю и движения хранилища. Роли доступа и начальный запас хранилища сохранятся.",
+             keyboard([[('⚠️ Подтвердить сброс', 'reset_confirm')], [('Отмена', 'reset_cancel')]]))
         return
 
     state = STATES.get(tid)
@@ -345,9 +361,9 @@ def on_message(message):
             target = player_by_name_or_card(text)
             if not target or target["id"] == player["id"]:
                 raise ValueError("Не нашёл другого игрока по нику или номеру карты.")
-            if re.fullmatch(r"ARA\d{9}", text, re.IGNORECASE):
+            if re.fullmatch(r"\d{5}", text):
                 state.update(target=target["id"], target_name=target["minecraft_name"], step="amount")
-                send(chat_id, f"Перевод на карту {text.upper()} игрока {target['minecraft_name']}. Введи целую сумму AR.")
+                send(chat_id, f"Перевод на карту {text} игрока {target['minecraft_name']}. Введи целую сумму AR.", home_markup())
                 return
             with db() as c:
                 cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (target["id"],)).fetchall()
@@ -355,6 +371,7 @@ def on_message(message):
                 raise ValueError("У игрока пока нет активной карты.")
             state.update(target=target["id"], target_name=target["minecraft_name"], step="pick_card")
             rows = [[(card["number"], f"pickcard:{card['id']}")] for card in cards]
+            rows.append([("🏠 Главное меню", "home")])
             api("sendMessage", {"chat_id": chat_id, "text": f"Выбери карту игрока {target['minecraft_name']}:", "reply_markup": keyboard(rows)})
             return
 
@@ -365,7 +382,7 @@ def on_message(message):
             if not target:
                 raise ValueError("Игрок или карта не найдены.")
             state.update(target=target["id"], target_name=target["minecraft_name"], step="amount")
-            send(chat_id, f"Игрок: {target['minecraft_name']}. Введи целую сумму AR.")
+            send(chat_id, f"Игрок: {target['minecraft_name']}. Введи целую сумму AR.", home_markup())
             return
 
         if step == "amount":
@@ -373,21 +390,21 @@ def on_message(message):
             if mode == "transfer":
                 op = record("transfer", player["id"], state["target"], amount, tid,
                             f"На карту {state.get('target_card', 'выбрана по нику')}")
-                send(chat_id, f"Готово: переведено {amount} AR игроку {state['target_name']}. Операция #{op}.", menu(tid))
+                send(chat_id, f"Готово: переведено {amount} AR игроку {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
             elif mode == "deposit":
                 op = record("deposit", None, state["target"], amount, tid, "Наличные AR сданы в кассу банка")
-                send(chat_id, f"Зачислено {amount} AR игроку {state['target_name']}. Операция #{op}.", menu(tid))
+                send(chat_id, f"Зачислено {amount} AR игроку {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
                 with db() as c:
                     recipient = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?", (state["target"],)).fetchone()
                 if recipient:
                     send(recipient["telegram_id"], f"На твой счёт внесено {amount} AR. Операция #{op}.")
             elif mode == "withdraw":
                 op = record("withdraw", state["target"], None, amount, tid, "Наличные AR выданы из хранилища банка")
-                send(chat_id, f"Снято {amount} AR со счёта {state['target_name']}. Операция #{op}.", menu(tid))
+                send(chat_id, f"Снято {amount} AR со счёта {state['target_name']}. Операция #{op}.", menu(tid, show_home=True))
             STATES.pop(tid, None)
             return
     except (ValueError, sqlite3.IntegrityError) as e:
-        send(chat_id, str(e) + "\nПопробуй ещё раз или отправь /cancel.")
+        send(chat_id, str(e) + "\nПопробуй ещё раз или отправь /cancel.", home_markup())
 
 
 def on_callback(query):
@@ -401,13 +418,29 @@ def on_callback(query):
             cards = c.execute("SELECT number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (player["id"],)).fetchall()
         card_lines = "\n".join("• " + r["number"] for r in cards) or "Карт нет"
         rows = [[("➕ Выпустить карту", "newcard")]] if len(cards) < 5 else []
-        rows.append([("↩️ В меню", "back")])
+        rows.append([("🏠 Главное меню", "home")])
         send(chat_id, f"Игрок: {player['minecraft_name']}\nБаланс: {balance(player['id'])} AR\nКарты:\n{card_lines}", keyboard(rows))
     elif data == "newcard" and player:
         card = issue_card(player["id"])
-        send(chat_id, f"Выпущена новая карта: {card}" if card else "У тебя уже максимум — пять карт.", menu(tid))
-    elif data == "back":
-        send(chat_id, "Выбери действие:", menu(tid))
+        send(chat_id, f"Выпущена новая карта: {card}" if card else "У тебя уже максимум — пять карт.", menu(tid, show_home=True))
+    elif data in ("home", "back"):
+        STATES.pop(tid, None)
+        send(chat_id, "Главное меню:", menu(tid))
+    elif data == "reset_prompt" and has_permission(tid, "admin"):
+        send(chat_id, "Сброс удалит всех тестовых игроков, карты, балансы, историю и движения хранилища. Роли доступа и начальный запас хранилища сохранятся.",
+             keyboard([[('⚠️ Подтвердить сброс', 'reset_confirm')], [('Отмена', 'reset_cancel')]]))
+    elif data == "reset_cancel" and has_permission(tid, "admin"):
+        send(chat_id, "Сброс отменён.", menu(tid))
+    elif data == "reset_confirm" and has_permission(tid, "admin"):
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("DELETE FROM ledger")
+            c.execute("DELETE FROM vault_events")
+            c.execute("DELETE FROM cards")
+            c.execute("DELETE FROM telegram_users")
+            c.execute("DELETE FROM players")
+        STATES.clear()
+        send(chat_id, "Тестовая база очищена: аккаунты, карты, балансы и история удалены. Роли сохранены.", menu(tid))
     elif data.startswith("pickcard:") and player:
         state = STATES.get(tid)
         if not state or state.get("mode") != "transfer" or state.get("step") != "pick_card":
@@ -417,22 +450,22 @@ def on_callback(query):
             card = c.execute("SELECT number FROM cards WHERE id=? AND player_id=? AND active=1", (card_id, state["target"])).fetchone()
         if not card:
             STATES.pop(tid, None)
-            send(chat_id, "Эта карта больше недоступна. Начни перевод заново.", menu(tid))
+            send(chat_id, "Эта карта больше недоступна. Начни перевод заново.", menu(tid, show_home=True))
             return
         state.update(step="amount", target_card=card["number"])
-        send(chat_id, f"Перевод на карту {card['number']} игрока {state['target_name']}. Введи целую сумму AR.")
+        send(chat_id, f"Перевод на карту {card['number']} игрока {state['target_name']}. Введи целую сумму AR.", home_markup())
     elif data == "transfer" and player:
         begin_state(tid, "transfer")
-        send(chat_id, "Введи Minecraft ник получателя или номер его карты. /cancel — отмена.")
+        send(chat_id, "Введи Minecraft ник получателя или номер его карты. /cancel — отмена.", home_markup())
     elif data == "history" and player:
-        send(chat_id, history_text(player["id"]), menu(tid))
+        send(chat_id, history_text(player["id"]), menu(tid, show_home=True))
     elif data in ("deposit", "withdraw") and has_permission(tid, "banker"):
         begin_state(tid, data)
-        send(chat_id, "Введи Minecraft ник игрока или номер карты. /cancel — отмена.")
+        send(chat_id, "Введи Minecraft ник игрока или номер карты. /cancel — отмена.", home_markup())
     elif data == "summary" and has_permission(tid, "view_ledger"):
-        send(chat_id, f"Игроков: {player_count()}\nAR на счетах: {total_balances()}\nAR в хранилище: {vault_cash()}\nВсе операции хранятся в журнале.", menu(tid))
+        send(chat_id, f"Игроков: {player_count()}\nAR на счетах: {total_balances()}\nAR в хранилище: {vault_cash()}\nВсе операции хранятся в журнале.", menu(tid, show_home=True))
     elif data == "ledger" and has_permission(tid, "view_ledger"):
-        send(chat_id, global_history_text(), menu(tid))
+        send(chat_id, global_history_text(), menu(tid, show_home=True))
 
 
 def player_count():

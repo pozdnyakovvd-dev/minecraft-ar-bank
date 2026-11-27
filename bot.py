@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 from collections import defaultdict, deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 def load_local_env():
     # Tiny .env reader so the prototype needs no third-party package.
@@ -101,6 +101,11 @@ def init_db():
             telegram_id INTEGER NOT NULL,
             permission TEXT NOT NULL,
             PRIMARY KEY (telegram_id, permission)
+        );
+        CREATE TABLE IF NOT EXISTS banker_calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            requester_player INTEGER NOT NULL REFERENCES players(id),
+            created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,6 +239,7 @@ def clear_test_data():
         c.execute("DELETE FROM ledger")
         c.execute("DELETE FROM vault_events")
         c.execute("DELETE FROM withdrawal_requests")
+        c.execute("DELETE FROM banker_calls")
         c.execute("DELETE FROM card_access")
         c.execute("DELETE FROM cards")
         c.execute("DELETE FROM telegram_users")
@@ -370,6 +376,20 @@ def issue_card(player_id):
         return number
 
 
+def issue_custom_card(player_id, number):
+    if not re.fullmatch(r"[0-9]{5}", number):
+        raise ValueError("Номер карты должен состоять ровно из пяти цифр.")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        active_count = c.execute("SELECT COUNT(*) FROM cards WHERE player_id=? AND active=1", (player_id,)).fetchone()[0]
+        if active_count >= 5:
+            raise ValueError("У игрока уже максимум — пять активных карт.")
+        if c.execute("SELECT 1 FROM cards WHERE number=?", (number,)).fetchone():
+            raise ValueError("Этот номер уже выдавался. Выбери другой пятизначный номер.")
+        c.execute("INSERT INTO cards(player_id,number,created_at) VALUES(?,?,?)", (player_id, number, now()))
+    return number
+
+
 def register(tid, name):
     if not valid_nickname(name):
         if re.fullmatch(r"[0-9]{5}", name):
@@ -393,7 +413,7 @@ def add_role(tid, permission):
 
 def menu(tid, show_home=False):
     rows = [[("💳 Баланс и карты", "account"), ("↔️ Перевод", "transfer")],
-            [("📜 История", "history")]]
+            [("📜 История", "history"), ("📣 Вызвать банкира", "call_banker")]]
     if has_permission(tid, "banker"):
         rows.append([("🏦 Внести АР", "deposit"), ("💸 Снять АР", "withdraw")])
     if has_permission(tid, "view_ledger"):
@@ -401,6 +421,7 @@ def menu(tid, show_home=False):
         rows.append([("👥 Игроки и карты", "players")])
     if has_permission(tid, "admin"):
         rows.append([("🛡 Управление банкирами", "manage_bankers")])
+        rows.append([("💳 Выпустить карту игроку", "admin_issue_card")])
         rows.append([("🧹 Сбросить тестовую базу", "reset_prompt")])
     if show_home:
         rows.append([("🏠 Главное меню", "home")])
@@ -435,6 +456,50 @@ def send_banker_management(chat_id, tid):
         send(chat_id, "Зарегистрированных игроков пока нет.", keyboard(rows))
     else:
         send(chat_id, "Управление ролью банкира. Администратор уже имеет все права.", keyboard(rows))
+
+
+def call_bankers(chat_id, tid, player):
+    with db() as c:
+        bankers = c.execute("SELECT DISTINCT telegram_id FROM roles WHERE permission IN ('banker','admin')").fetchall()
+    if not bankers:
+        send(chat_id, "Пока ни одному Telegram аккаунту не выдана роль банкира.", menu(tid, show_home=True))
+        return
+
+    current = datetime.now(timezone.utc)
+    cutoff = (current - timedelta(minutes=3)).isoformat(timespec="seconds")
+    seconds_left = None
+    call_id = None
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        last_call = c.execute("SELECT created_at FROM banker_calls ORDER BY id DESC LIMIT 1").fetchone()
+        if last_call and last_call["created_at"] > cutoff:
+            last_time = datetime.fromisoformat(last_call["created_at"])
+            seconds_left = max(1, int((last_time + timedelta(minutes=3) - current).total_seconds()))
+        else:
+            c.execute("DELETE FROM banker_calls")
+            cursor = c.execute("INSERT INTO banker_calls(requester_player,created_at) VALUES(?,?)",
+                               (player["id"], current.isoformat(timespec="seconds")))
+            call_id = cursor.lastrowid
+
+    if seconds_left is not None:
+        send(chat_id, f"Банкиров уже вызвали. Подожди ещё примерно {seconds_left} сек.", menu(tid, show_home=True))
+        return
+
+    delivered = 0
+    for banker in bankers:
+        try:
+            send(banker["telegram_id"],
+                 f"📣 Игрок {player['minecraft_name']} вызывает банкира в банк. Если можешь прийти — откликнись ему в игре или в Telegram.")
+            delivered += 1
+        except Exception as exc:
+            print(f"Banker call delivery failed for Telegram user {banker['telegram_id']}: {exc}")
+
+    if delivered:
+        send(chat_id, "Вызов отправлен банкирам. Подожди, пока кто-нибудь откликнется.", menu(tid, show_home=True))
+    else:
+        with db() as c:
+            c.execute("DELETE FROM banker_calls WHERE id=?", (call_id,))
+        send(chat_id, "Не удалось доставить вызов. Попроси банкиров открыть бота и отправить /start.", menu(tid, show_home=True))
 
 
 def home_markup():
@@ -628,8 +693,7 @@ def on_message(message):
     player = user_player(tid)
 
     if text.startswith("/start"):
-        if STATES.get(tid, {}).get("mode") == "admin_reset":
-            STATES.pop(tid, None)
+        STATES.pop(tid, None)
         if player:
             send(chat_id, f"Йоу, {player['minecraft_name']}! Это банк сервера.\nВыбери действие:", menu(tid))
         else:
@@ -642,7 +706,7 @@ def on_message(message):
         send(chat_id, "Действие отменено.", menu(tid) if player else None)
         return
 
-    if text.startswith("/") and STATES.get(tid, {}).get("mode") == "admin_reset":
+    if text.startswith("/") and tid in STATES:
         STATES.pop(tid, None)
 
     if text.startswith("/setrole"):
@@ -706,6 +770,38 @@ def on_message(message):
             STATES.clear()
             send(chat_id, "Тестовая база очищена: аккаунты, карты, балансы и история удалены. Роли сохранены.", menu(tid))
             return
+
+        if mode == "admin_issue_card":
+            if not has_permission(tid, "admin"):
+                STATES.pop(tid, None)
+                send(chat_id, "Нет доступа администратора.", menu(tid))
+                return
+            if step == "target":
+                if not valid_nickname(text):
+                    raise ValueError("Введи точный Minecraft ник игрока. Ники из пяти цифр запрещены.")
+                target = player_by_name(text)
+                if not target:
+                    raise ValueError("Этот ник ещё не зарегистрирован в банке.")
+                with db() as c:
+                    active_count = c.execute("SELECT COUNT(*) FROM cards WHERE player_id=? AND active=1", (target["id"],)).fetchone()[0]
+                if active_count >= 5:
+                    raise ValueError("У игрока уже максимум — пять активных карт.")
+                state.update(step="number", target_player_id=target["id"], target_name=target["minecraft_name"])
+                send(chat_id, f"Игрок: {target['minecraft_name']}. Введи желаемый номер карты из пяти цифр.", home_markup())
+                return
+            if step == "number":
+                number = issue_custom_card(state["target_player_id"], text)
+                STATES.pop(tid, None)
+                send(chat_id, f"Карта {number} выпущена игроку {state['target_name']}.", menu(tid, show_home=True))
+                with db() as c:
+                    target_user = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?",
+                                            (state["target_player_id"],)).fetchone()
+                if target_user:
+                    try:
+                        send(target_user["telegram_id"], f"Администратор выпустил тебе карту {number}.")
+                    except Exception as exc:
+                        print(f"Custom card notification failed for Telegram user {target_user['telegram_id']}: {exc}")
+                return
 
         if mode == "register" and step == "name":
             pid = register(tid, text)
@@ -918,6 +1014,9 @@ def on_callback(query):
         send_banker_management(chat_id, tid)
     elif data == "noop" and has_permission(tid, "admin"):
         send(chat_id, "Администратор уже имеет все права.", menu(tid, show_home=True))
+    elif data == "admin_issue_card" and has_permission(tid, "admin"):
+        STATES[tid] = {"mode": "admin_issue_card", "step": "target"}
+        send(chat_id, "Введи Minecraft ник зарегистрированного игрока, которому выпустить карту. /cancel — отмена.", home_markup())
     elif data.startswith("banker_toggle:") and has_permission(tid, "admin"):
         raw_player_id = data.split(":", 1)[1]
         if (not re.fullmatch(r"[0-9]{1,19}", raw_player_id)
@@ -983,6 +1082,8 @@ def on_callback(query):
         send(chat_id, "Введи Minecraft ник получателя или номер его карты.", home_markup())
     elif data == "history" and player:
         send(chat_id, history_text(player["id"], tid), menu(tid, show_home=True))
+    elif data == "call_banker" and player:
+        call_bankers(chat_id, tid, player)
     elif data in ("deposit", "withdraw") and has_permission(tid, "banker"):
         begin_state(tid, data)
         send(chat_id, "Введи Minecraft ник игрока или номер карты. /cancel — отмена.", home_markup())

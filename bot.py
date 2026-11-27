@@ -27,7 +27,23 @@ def load_local_env():
 
 load_local_env()
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-DB_PATH = os.environ.get("BANK_DB_PATH", "bank.sqlite3")
+DATA_DIR = os.path.abspath(os.environ.get("DATA_DIR") or os.path.join(os.getcwd(), "data"))
+CONFIGURED_DB_PATH = os.environ.get("BANK_DB_PATH", "bank.sqlite3").strip() or "bank.sqlite3"
+if os.path.isabs(CONFIGURED_DB_PATH):
+    requested_db_path = os.path.normpath(CONFIGURED_DB_PATH)
+    app_dir = os.path.abspath(os.getcwd())
+    if os.path.commonpath((DATA_DIR, requested_db_path)) == DATA_DIR and requested_db_path != DATA_DIR:
+        DB_PATH = requested_db_path
+        LEGACY_DB_PATH = os.path.abspath(os.path.relpath(DB_PATH, DATA_DIR))
+    elif os.path.commonpath((app_dir, requested_db_path)) == app_dir:
+        DB_PATH = os.path.join(DATA_DIR, os.path.relpath(requested_db_path, app_dir))
+        LEGACY_DB_PATH = requested_db_path
+    else:
+        DB_PATH = requested_db_path
+        LEGACY_DB_PATH = None
+else:
+    DB_PATH = os.path.join(DATA_DIR, CONFIGURED_DB_PATH)
+    LEGACY_DB_PATH = os.path.abspath(CONFIGURED_DB_PATH)
 STARTING_VAULT = os.environ.get("BANK_STARTING_VAULT_AR", "0")
 if not TOKEN:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN in the environment first.")
@@ -59,7 +75,33 @@ def db():
         conn.close()
 
 
+def prepare_database_location():
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    target = os.path.abspath(DB_PATH)
+    if not LEGACY_DB_PATH or LEGACY_DB_PATH == target:
+        return
+    if os.path.exists(target) or not os.path.isfile(LEGACY_DB_PATH):
+        return
+
+    # Move the old working-directory database and its SQLite WAL files together.
+    moved_files = []
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            source_file = LEGACY_DB_PATH + suffix
+            target_file = target + suffix
+            if os.path.exists(source_file):
+                os.replace(source_file, target_file)
+                moved_files.append((source_file, target_file))
+    except Exception:
+        for source_file, target_file in reversed(moved_files):
+            if os.path.exists(target_file):
+                os.replace(target_file, source_file)
+        raise
+    print(f"Moved existing SQLite database to persistent data path: {target}")
+
+
 def init_db():
+    prepare_database_location()
     with db() as c:
         c.executescript("""
         CREATE TABLE IF NOT EXISTS players (
@@ -1178,7 +1220,7 @@ def split_message(text, limit=3600):
 
 def main():
     init_db()
-    print("Telegram bank prototype is polling. Press Ctrl+C to stop.")
+    print(f"Telegram bank prototype is polling. SQLite database: {os.path.abspath(DB_PATH)}")
     offset = 0
     while True:
         try:

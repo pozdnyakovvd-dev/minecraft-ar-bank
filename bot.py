@@ -45,7 +45,7 @@ else:
     DB_PATH = os.path.join(DATA_DIR, CONFIGURED_DB_PATH)
     LEGACY_DB_PATH = os.path.abspath(CONFIGURED_DB_PATH)
 STARTING_VAULT = os.environ.get("BANK_STARTING_VAULT_AR", "0")
-if not TOKEN:
+if not TOKEN and __name__ == "__main__":
     raise SystemExit("Set TELEGRAM_BOT_TOKEN in the environment first.")
 
 API = f"https://api.telegram.org/bot{TOKEN}/"
@@ -316,7 +316,7 @@ def balance(card_id):
     with db() as c:
         row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                    COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0) AS value
-                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
+                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
                          (card_id, card_id)).fetchone()
     return int(row["value"])
 
@@ -394,7 +394,7 @@ def total_balances():
     with db() as c:
         row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id IS NOT NULL THEN amount ELSE 0 END),0)-
                                    COALESCE(SUM(CASE WHEN from_card_id IS NOT NULL THEN amount ELSE 0 END),0) AS value
-                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""").fetchone()
+                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""").fetchone()
     return int(row["value"])
 
 
@@ -561,12 +561,16 @@ def history_text(player_id, telegram_id=None):
                               (player_id, player_id, telegram_id)).fetchall()
     if not rows:
         return "Операций пока нет."
-    labels = {"deposit": "Внесение", "withdraw": "Снятие", "transfer": "Перевод", "correction": "Исправление"}
+    labels = {"deposit": "Внесение", "withdraw": "Снятие", "transfer": "Перевод", "correction": "Исправление",
+              "casino_bet": "Ставка казино", "casino_win": "Выигрыш казино",
+              "casino_deposit": "Депозит в казино", "casino_withdraw": "Вывод из казино"}
     result = []
     for r in rows:
         if r["kind"] == "deposit": detail = "внесение наличных АР"
         elif r["kind"] == "withdraw": detail = "снятие наличных АР"
         elif r["kind"] == "transfer": detail = f"{r['sender']} → {r['receiver']}"
+        elif r["kind"] == "casino_deposit": detail = "перевод в кошелёк казино"
+        elif r["kind"] == "casino_withdraw": detail = "вывод из кошелька казино"
         else: detail = r["note"] or "исправление"
         suffix = f" ({r['note']})" if r["note"] else ""
         result.append(f"#{r['id']} · {labels.get(r['kind'], r['kind'])}: {detail}, {r['amount']} АР{suffix}")
@@ -584,7 +588,7 @@ def record(kind, sender, receiver, amount, actor, note="", from_card_id=None, to
                 raise ValueError("Карта списания не найдена или выключена.")
             bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                       COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
-                               FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
+               FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
                             (from_card_id, from_card_id)).fetchone()[0]
             held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (from_card_id,)).fetchone()[0]
             available = int(bal) - int(held)
@@ -620,7 +624,7 @@ def create_withdrawal_request(account_id, requester_id, source_card_id, amount):
             raise ValueError("Карта снятия не найдена или выключена.")
         bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                   COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
-                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
+                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
                         (source_card_id, source_card_id)).fetchone()[0]
         held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (source_card_id,)).fetchone()[0]
         available = int(bal) - int(held)
@@ -643,7 +647,7 @@ def fulfill_withdrawal_request(request_id, banker_telegram_id):
         card_id = request["source_card_id"]
         bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                   COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
-                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction')""",
+                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
                         (card_id, card_id)).fetchone()[0]
         held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending' AND id<>?", (card_id, request_id)).fetchone()[0]
         if int(bal) - int(held) < amount:

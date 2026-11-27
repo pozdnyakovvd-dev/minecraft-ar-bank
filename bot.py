@@ -2,12 +2,15 @@
 """Tiny Telegram bank prototype. Python standard library only."""
 
 import json
+import hmac
 import os
 import re
 import sqlite3
+import threading
 import time
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -49,6 +52,8 @@ if not TOKEN and __name__ == "__main__":
     raise SystemExit("Set TELEGRAM_BOT_TOKEN in the environment first.")
 
 API = f"https://api.telegram.org/bot{TOKEN}/"
+BANK_API_TOKEN = os.environ.get("BANK_API_TOKEN", "").strip()
+BANK_API_PORT = os.environ.get("BANK_API_PORT", "").strip()
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 MAX_AMOUNT = 2_147_483_647
 MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
@@ -169,6 +174,21 @@ def init_db():
             actor_telegram_id INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS fines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL REFERENCES players(id),
+            amount INTEGER NOT NULL CHECK(amount > 0),
+            reason TEXT NOT NULL,
+            payee_card_id INTEGER NOT NULL REFERENCES cards(id),
+            issued_by_telegram_id INTEGER NOT NULL,
+            issued_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unpaid' CHECK(status IN ('unpaid','paid')),
+            paid_at TEXT,
+            paid_by_telegram_id INTEGER,
+            source_card_id INTEGER REFERENCES cards(id),
+            ledger_id INTEGER REFERENCES ledger(id)
+        );
+        CREATE INDEX IF NOT EXISTS fines_player_status_idx ON fines(player_id,status,id DESC);
         CREATE INDEX IF NOT EXISTS ledger_from_idx ON ledger(from_player, id DESC);
         CREATE INDEX IF NOT EXISTS ledger_to_idx ON ledger(to_player, id DESC);
         """)
@@ -278,6 +298,7 @@ def prompt_reset_confirmation(chat_id, tid):
 def clear_test_data():
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM fines")
         c.execute("DELETE FROM ledger")
         c.execute("DELETE FROM vault_events")
         c.execute("DELETE FROM withdrawal_requests")
@@ -316,7 +337,7 @@ def balance(card_id):
     with db() as c:
         row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                    COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0) AS value
-                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
+                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw','fine_payment')""",
                          (card_id, card_id)).fetchone()
     return int(row["value"])
 
@@ -394,7 +415,7 @@ def total_balances():
     with db() as c:
         row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id IS NOT NULL THEN amount ELSE 0 END),0)-
                                    COALESCE(SUM(CASE WHEN from_card_id IS NOT NULL THEN amount ELSE 0 END),0) AS value
-                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""").fetchone()
+                            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw','fine_payment')""").fetchone()
     return int(row["value"])
 
 
@@ -440,10 +461,14 @@ def register(tid, name):
     with db() as c:
         if c.execute("SELECT 1 FROM telegram_users WHERE telegram_id=?", (tid,)).fetchone():
             raise ValueError("Этот Telegram уже привязан к банковскому аккаунту.")
-        if c.execute("SELECT 1 FROM players WHERE minecraft_name=? COLLATE NOCASE", (name,)).fetchone():
-            raise ValueError("Этот игровой ник уже зарегистрирован в банке.")
-        cur = c.execute("INSERT INTO players(minecraft_name,created_at) VALUES(?,?)", (name, now()))
-        pid = cur.lastrowid
+        existing = c.execute("SELECT id FROM players WHERE minecraft_name=? COLLATE NOCASE", (name,)).fetchone()
+        if existing:
+            if c.execute("SELECT 1 FROM telegram_users WHERE player_id=?", (existing["id"],)).fetchone():
+                raise ValueError("Этот игровой аккаунт уже привязан к Telegram.")
+            pid = existing["id"]
+        else:
+            cur = c.execute("INSERT INTO players(minecraft_name,created_at) VALUES(?,?)", (name, now()))
+            pid = cur.lastrowid
         c.execute("INSERT INTO telegram_users(telegram_id,player_id,created_at) VALUES(?,?,?)", (tid, pid, now()))
     return pid
 
@@ -464,7 +489,10 @@ def menu(tid, show_home=False):
     if has_permission(tid, "admin"):
         rows.append([("🛡 Управление банкирами", "manage_bankers")])
         rows.append([("💳 Выпустить карту игроку", "admin_issue_card")])
+        rows.append([("⚖️ Выписать штраф", "admin_fine")])
         rows.append([("🧹 Сбросить тестовую базу", "reset_prompt")])
+    if user_player(tid):
+        rows.append([("⚖️ Мои штрафы", "my_fines")])
     if show_home:
         rows.append([("🏠 Главное меню", "home")])
     send_menu = keyboard(rows)
@@ -551,11 +579,13 @@ def home_markup():
 def history_text(player_id, telegram_id=None):
     with db() as c:
         if telegram_id is None:
-            rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver
+            rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver,
+                (SELECT p.minecraft_name FROM telegram_users t JOIN players p ON p.id=t.player_id WHERE t.telegram_id=l.actor_telegram_id) AS actor_name
             FROM ledger l LEFT JOIN players a ON a.id=l.from_player LEFT JOIN players b ON b.id=l.to_player
             WHERE l.from_player=? OR l.to_player=? ORDER BY l.id DESC LIMIT 10""", (player_id, player_id)).fetchall()
         else:
-            rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver
+            rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver,
+                (SELECT p.minecraft_name FROM telegram_users t JOIN players p ON p.id=t.player_id WHERE t.telegram_id=l.actor_telegram_id) AS actor_name
             FROM ledger l LEFT JOIN players a ON a.id=l.from_player LEFT JOIN players b ON b.id=l.to_player
             WHERE l.from_player=? OR l.to_player=? OR l.actor_telegram_id=? ORDER BY l.id DESC LIMIT 10""",
                               (player_id, player_id, telegram_id)).fetchall()
@@ -563,7 +593,7 @@ def history_text(player_id, telegram_id=None):
         return "Операций пока нет."
     labels = {"deposit": "Внесение", "withdraw": "Снятие", "transfer": "Перевод", "correction": "Исправление",
               "casino_bet": "Ставка казино", "casino_win": "Выигрыш казино",
-              "casino_deposit": "Депозит в казино", "casino_withdraw": "Вывод из казино"}
+              "casino_deposit": "Депозит в казино", "casino_withdraw": "Вывод из казино", "fine_payment": "Оплата штрафа"}
     result = []
     for r in rows:
         if r["kind"] == "deposit": detail = "внесение наличных АР"
@@ -571,8 +601,11 @@ def history_text(player_id, telegram_id=None):
         elif r["kind"] == "transfer": detail = f"{r['sender']} → {r['receiver']}"
         elif r["kind"] == "casino_deposit": detail = "перевод в кошелёк казино"
         elif r["kind"] == "casino_withdraw": detail = "вывод из кошелька казино"
+        elif r["kind"] == "fine_payment": detail = "платёж в пользу получателя штрафа"
         else: detail = r["note"] or "исправление"
         suffix = f" ({r['note']})" if r["note"] else ""
+        if r["kind"] in ("deposit", "withdraw"):
+            detail += f" · банкир: {r['actor_name'] or 'Telegram ID ' + str(r['actor_telegram_id'])}"
         result.append(f"#{r['id']} · {labels.get(r['kind'], r['kind'])}: {detail}, {r['amount']} АР{suffix}")
     return "Последние операции:\n" + "\n".join(result)
 
@@ -582,19 +615,19 @@ def record(kind, sender, receiver, amount, actor, note="", from_card_id=None, to
         raise ValueError("Сумма должна быть целым числом больше нуля.")
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
-        if kind in ("withdraw", "transfer"):
+        if kind in ("withdraw", "transfer", "fine_payment"):
             owner = c.execute("SELECT player_id FROM cards WHERE id=? AND active=1", (from_card_id,)).fetchone()
             if not owner or owner["player_id"] != sender:
                 raise ValueError("Карта списания не найдена или выключена.")
             bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                       COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
-               FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
+               FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw','fine_payment')""",
                             (from_card_id, from_card_id)).fetchone()[0]
             held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (from_card_id,)).fetchone()[0]
             available = int(bal) - int(held)
             if available < amount:
                 raise ValueError(f"Недостаточно свободных средств на карте. Доступно: {available} АР.")
-        if kind in ("deposit", "transfer"):
+        if kind in ("deposit", "transfer", "fine_payment"):
             owner = c.execute("SELECT player_id FROM cards WHERE id=? AND active=1", (to_card_id,)).fetchone()
             if not owner or owner["player_id"] != receiver:
                 raise ValueError("Карта зачисления не найдена или выключена.")
@@ -614,6 +647,83 @@ def record(kind, sender, receiver, amount, actor, note="", from_card_id=None, to
         return c.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
+def sync_player(name):
+    """Create a bank account shell for a server-registered name, without issuing a card."""
+    if not valid_nickname(name):
+        raise ValueError("Некорректный Minecraft ник.")
+    with db() as c:
+        c.execute("INSERT OR IGNORE INTO players(minecraft_name,created_at) VALUES(?,?)", (name, now()))
+        row = c.execute("SELECT id,minecraft_name FROM players WHERE minecraft_name=? COLLATE NOCASE", (name,)).fetchone()
+    return dict(row)
+
+
+def unpaid_fines(player_id):
+    with db() as c:
+        return c.execute("""SELECT f.*,k.number AS payee_card_number,p.minecraft_name AS payee_name,
+            (SELECT q.minecraft_name FROM telegram_users t JOIN players q ON q.id=t.player_id
+                WHERE t.telegram_id=f.issued_by_telegram_id) AS issuer_name
+            FROM fines f JOIN cards k ON k.id=f.payee_card_id JOIN players p ON p.id=k.player_id
+            WHERE f.player_id=? AND f.status='unpaid' ORDER BY f.id""", (player_id,)).fetchall()
+
+
+def issue_fine(player_id, amount, reason, payee_card_id, issuer_tid):
+    if not (1 <= amount <= MAX_AMOUNT):
+        raise ValueError("Некорректная сумма штрафа.")
+    reason = reason.strip()
+    if not reason or len(reason) > 180:
+        raise ValueError("Причина штрафа должна содержать от 1 до 180 символов.")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        player = c.execute("SELECT id FROM players WHERE id=?", (player_id,)).fetchone()
+        payee = c.execute("SELECT id,player_id FROM cards WHERE id=? AND active=1", (payee_card_id,)).fetchone()
+        if not player or not payee:
+            raise ValueError("Игрок или карта получателя не найдены.")
+        if payee["player_id"] == player_id:
+            raise ValueError("Нельзя выписать штраф в пользу карты самого оштрафованного игрока.")
+        cur = c.execute("""INSERT INTO fines(player_id,amount,reason,payee_card_id,issued_by_telegram_id,issued_at)
+            VALUES(?,?,?,?,?,?)""", (player_id, amount, reason, payee_card_id, issuer_tid, now()))
+        return cur.lastrowid
+
+
+def fine_list_text(player_id):
+    rows = unpaid_fines(player_id)
+    if not rows:
+        return "Неоплаченных штрафов нет."
+    return "⚖️ Неоплаченные штрафы:\n" + "\n".join(
+        f"#{row['id']} · {row['amount']} АР · {row['reason']}\nКому: {row['payee_name']}, карта {row['payee_card_number']}\nВыписал: {row['issuer_name'] or 'Telegram ID ' + str(row['issued_by_telegram_id'])}"
+        for row in rows)
+
+
+def pay_fine(fine_id, player_id, source_card_id, payer_tid):
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        fine = c.execute("SELECT * FROM fines WHERE id=? AND player_id=? AND status='unpaid'", (fine_id, player_id)).fetchone()
+        if not fine:
+            raise ValueError("Штраф уже оплачен или не найден.")
+        source = c.execute("SELECT id,player_id FROM cards WHERE id=? AND active=1", (source_card_id,)).fetchone()
+        beneficiary = c.execute("SELECT id,player_id,active FROM cards WHERE id=?", (fine['payee_card_id'],)).fetchone()
+        if not source or source['player_id'] != player_id:
+            raise ValueError("Списать штраф можно только со своей активной карты.")
+        if not beneficiary or not beneficiary['active']:
+            raise ValueError("Карта получателя штрафа отключена; обратись к администратору.")
+        balance_row = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
+            COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
+            FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw','fine_payment')""",
+            (source_card_id, source_card_id)).fetchone()
+        held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (source_card_id,)).fetchone()[0]
+        available = int(balance_row[0]) - int(held)
+        if available < fine['amount']:
+            raise ValueError(f"На карте недостаточно средств. Доступно: {available} АР.")
+        note = f"Штраф #{fine_id}: {fine['reason']}"
+        c.execute("""INSERT INTO ledger(kind,from_player,to_player,from_card_id,to_card_id,amount,actor_telegram_id,note,created_at)
+            VALUES('fine_payment',?,?,?,?,?,?,?,?)""",
+            (player_id, beneficiary['player_id'], source_card_id, beneficiary['id'], fine['amount'], payer_tid, note, now()))
+        ledger_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        c.execute("UPDATE fines SET status='paid',paid_at=?,paid_by_telegram_id=?,source_card_id=?,ledger_id=? WHERE id=? AND status='unpaid'",
+                  (now(), payer_tid, source_card_id, ledger_id, fine_id))
+        return ledger_id, int(fine['amount']), int(beneficiary['id'])
+
+
 def create_withdrawal_request(account_id, requester_id, source_card_id, amount):
     if amount <= 0:
         raise ValueError("Сумма должна быть целым числом больше нуля.")
@@ -624,7 +734,7 @@ def create_withdrawal_request(account_id, requester_id, source_card_id, amount):
             raise ValueError("Карта снятия не найдена или выключена.")
         bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                   COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
-                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
+                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw','fine_payment')""",
                         (source_card_id, source_card_id)).fetchone()[0]
         held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending'", (source_card_id,)).fetchone()[0]
         available = int(bal) - int(held)
@@ -647,7 +757,7 @@ def fulfill_withdrawal_request(request_id, banker_telegram_id):
         card_id = request["source_card_id"]
         bal = c.execute("""SELECT COALESCE(SUM(CASE WHEN to_card_id=? THEN amount ELSE 0 END),0)-
                                   COALESCE(SUM(CASE WHEN from_card_id=? THEN amount ELSE 0 END),0)
-                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw')""",
+                           FROM ledger WHERE kind IN ('deposit','withdraw','transfer','correction','casino_deposit','casino_withdraw','fine_payment')""",
                         (card_id, card_id)).fetchone()[0]
         held = c.execute("SELECT COALESCE(SUM(amount),0) FROM withdrawal_requests WHERE source_card_id=? AND status='pending' AND id<>?", (card_id, request_id)).fetchone()[0]
         if int(bal) - int(held) < amount:
@@ -794,7 +904,7 @@ def on_message(message):
     mode, step = state["mode"], state["step"]
 
     try:
-        if mode in ("deposit", "withdraw") and not has_permission(tid, "banker"):
+        if mode in ("deposit", "withdraw") and not (has_permission(tid, "banker") or has_permission(tid, "admin")):
             STATES.pop(tid, None)
             send(chat_id, "Роль банкира больше не активна.", menu(tid))
             return
@@ -837,11 +947,12 @@ def on_message(message):
                 return
             if step == "number":
                 number = issue_custom_card(state["target_player_id"], text)
+                target_name = state["target_name"]
+                target_player_id = state["target_player_id"]
                 STATES.pop(tid, None)
-                send(chat_id, f"Карта {number} выпущена игроку {state['target_name']}.", menu(tid, show_home=True))
+                send(chat_id, f"Карта {number} выпущена игроку {target_name}.", menu(tid, show_home=True))
                 with db() as c:
-                    target_user = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?",
-                                            (state["target_player_id"],)).fetchone()
+                    target_user = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?", (target_player_id,)).fetchone()
                 if target_user:
                     try:
                         send(target_user["telegram_id"], f"Администратор выпустил тебе карту {number}.")
@@ -849,11 +960,42 @@ def on_message(message):
                         print(f"Custom card notification failed for Telegram user {target_user['telegram_id']}: {exc}")
                 return
 
+        if mode == "admin_fine":
+            if not has_permission(tid, "admin"):
+                STATES.pop(tid, None)
+                send(chat_id, "Нет доступа администратора.", menu(tid))
+                return
+            if step == "target":
+                target = player_by_name(text)
+                if not target:
+                    raise ValueError("Игрок не найден. Сначала зарегистрируй его в банке или синхронизируй через сервер.")
+                state.update(step="amount", fine_player_id=target["id"], fine_player_name=target["minecraft_name"])
+                send(chat_id, f"Игрок: {target['minecraft_name']}. Введи сумму штрафа в целых АР.", home_markup())
+                return
+            if step == "amount":
+                amount = parse_amount(text)
+                state.update(step="reason", fine_amount=amount)
+                send(chat_id, "Введи текст причины штрафа (до 180 символов).", home_markup())
+                return
+            if step == "reason":
+                reason = text.strip()
+                if not reason or len(reason) > 180:
+                    raise ValueError("Причина штрафа должна содержать от 1 до 180 символов.")
+                with db() as c:
+                    payees = c.execute("""SELECT k.id,k.number,p.minecraft_name FROM cards k
+                        JOIN players p ON p.id=k.player_id WHERE k.active=1 ORDER BY p.minecraft_name COLLATE NOCASE,k.number""").fetchall()
+                if not payees:
+                    raise ValueError("Нет активных карт для получателя платежа. Сначала выпусти карту правительства или ведомства.")
+                state.update(step="payee", fine_reason=reason)
+                rows = [[(f"{r['minecraft_name']} · карта {r['number']}", f"finepayee:{r['id']}")] for r in payees]
+                rows.append([("🏠 Главное меню", "home")])
+                send(chat_id, "Выбери, в пользу кого будет оплачен штраф:", keyboard(rows))
+                return
+
         if mode == "register" and step == "name":
             pid = register(tid, text)
-            card = issue_card(pid)
             STATES.pop(tid, None)
-            send(chat_id, f"Аккаунт {text} привязан к этому Telegram. Твоя первая карта: {card}", menu(tid))
+            send(chat_id, f"Аккаунт {text} создан и привязан к этому Telegram. Карты пока нет: выпусти её в разделе «Баланс и карты».", menu(tid))
             return
 
         if mode == "share" and step == "recipient":
@@ -902,11 +1044,14 @@ def on_message(message):
             return
 
         if mode in ("deposit", "withdraw") and step == "target":
-            if not has_permission(tid, "banker"):
-                raise ValueError("Нет доступа банкира.")
+            if not (has_permission(tid, "banker") or has_permission(tid, "admin")):
+                raise ValueError("Нет доступа.")
             target = player_by_name_or_card(text)
             if not target:
                 raise ValueError("Игрок или карта не найдены.")
+            own_player = user_player(tid)
+            if not has_permission(tid, "admin") and (not own_player or own_player["id"] == target["id"]):
+                raise ValueError("Банкир может вносить или снимать АР на счетах других игроков, но не на своём. Администратор может работать со всеми счетами.")
             with db() as c:
                 if re.fullmatch(r"\d{5}", text):
                     cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND number=? AND active=1", (target["id"], text)).fetchall()
@@ -1006,6 +1151,11 @@ def on_callback(query):
         if card_balance != 0:
             send(chat_id, f"На карте {card_balance} АР. Сначала переведи остаток на другую карту, потом удаляй.", menu(tid, show_home=True))
             return
+        with db() as c:
+            pending_fines = c.execute("SELECT COUNT(*) FROM fines WHERE payee_card_id=? AND status='unpaid'", (card_id,)).fetchone()[0]
+        if pending_fines:
+            send(chat_id, "Эта карта указана получателем неоплаченных штрафов. Сначала переназначь их через администратора.", menu(tid, show_home=True))
+            return
         if pending_withdrawals(card_id) > 0:
             send(chat_id, "По этой карте есть ожидающая заявка на снятие. Дождись её обработки.", menu(tid, show_home=True))
             return
@@ -1063,6 +1213,69 @@ def on_callback(query):
     elif data == "admin_issue_card" and has_permission(tid, "admin"):
         STATES[tid] = {"mode": "admin_issue_card", "step": "target"}
         send(chat_id, "Введи Minecraft ник зарегистрированного игрока, которому выпустить карту. /cancel — отмена.", home_markup())
+    elif data == "admin_fine" and has_permission(tid, "admin"):
+        STATES[tid] = {"mode": "admin_fine", "step": "target"}
+        send(chat_id, "Введи Minecraft ник игрока, которому выписывается штраф. /cancel — отмена.", home_markup())
+    elif data == "my_fines" and player:
+        fines = unpaid_fines(player["id"])
+        rows = [[(f"💳 Оплатить штраф #{fine['id']} · {fine['amount']} АР", f"finepay:{fine['id']}")] for fine in fines]
+        rows.append([("🏠 Главное меню", "home")])
+        send(chat_id, fine_list_text(player["id"]), keyboard(rows))
+    elif data.startswith("finepay:") and player:
+        try:
+            fine_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        fine = next((item for item in unpaid_fines(player["id"]) if item["id"] == fine_id), None)
+        if not fine:
+            send(chat_id, "Штраф уже оплачен или не найден.", menu(tid, show_home=True))
+            return
+        with db() as c:
+            cards = c.execute("SELECT id,number FROM cards WHERE player_id=? AND active=1 ORDER BY id", (player["id"],)).fetchall()
+        if not cards:
+            send(chat_id, "У тебя пока нет активной карты. Выпусти её в разделе «Баланс и карты», затем оплати штраф.", menu(tid, show_home=True))
+            return
+        rows = [[(f"Карта {card['number']} · {balance(card['id'])} АР", f"finecard:{fine_id}:{card['id']}")] for card in cards]
+        rows.append([("🏠 Главное меню", "home")])
+        send(chat_id, f"Штраф #{fine_id}: {fine['amount']} АР. Выбери карту для оплаты:", keyboard(rows))
+    elif data.startswith("finecard:") and player:
+        try:
+            _, raw_fine_id, raw_card_id = data.split(":", 2)
+            fine_id, card_id = int(raw_fine_id), int(raw_card_id)
+        except ValueError:
+            return
+        try:
+            ledger_id, amount, beneficiary_card_id = pay_fine(fine_id, player["id"], card_id, tid)
+        except ValueError as exc:
+            send(chat_id, str(exc), menu(tid, show_home=True))
+            return
+        send(chat_id, f"Штраф #{fine_id} оплачен: списано {amount} АР. Операция #{ledger_id}.", menu(tid, show_home=True))
+        notify_card_users(beneficiary_card_id, f"Получена оплата штрафа #{fine_id}: {amount} АР. Операция #{ledger_id}.")
+    elif data.startswith("finepayee:") and has_permission(tid, "admin"):
+        state = STATES.get(tid)
+        if not state or state.get("mode") != "admin_fine" or state.get("step") != "payee":
+            return
+        try:
+            payee_card_id = int(data.split(":", 1)[1])
+        except ValueError:
+            return
+        try:
+            fine_id = issue_fine(state["fine_player_id"], state["fine_amount"], state["fine_reason"], payee_card_id, tid)
+        except ValueError as exc:
+            STATES.pop(tid, None)
+            send(chat_id, str(exc), menu(tid, show_home=True))
+            return
+        target_name = state["fine_player_name"]
+        target_id = state["fine_player_id"]
+        STATES.pop(tid, None)
+        send(chat_id, f"Штраф #{fine_id} выписан игроку {target_name}: {state['fine_amount']} АР. Он сможет оплатить его после выпуска карты.", menu(tid, show_home=True))
+        with db() as c:
+            target_tg = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?", (target_id,)).fetchone()
+        if target_tg:
+            try:
+                send(target_tg["telegram_id"], f"⚖️ Тебе выписан штраф #{fine_id}: {state['fine_amount']} АР. Причина: {state['fine_reason']}\nОткрой «Мои штрафы» в банковском боте для оплаты.", menu(target_tg["telegram_id"], show_home=True))
+            except Exception as exc:
+                print(f"Fine notification failed for Telegram user {target_tg['telegram_id']}: {exc}")
     elif data.startswith("banker_toggle:") and has_permission(tid, "admin"):
         raw_player_id = data.split(":", 1)[1]
         if (not re.fullmatch(r"[0-9]{1,19}", raw_player_id)
@@ -1130,16 +1343,25 @@ def on_callback(query):
         send(chat_id, history_text(player["id"], tid), menu(tid, show_home=True))
     elif data == "call_banker" and player:
         call_bankers(chat_id, tid, player)
-    elif data in ("deposit", "withdraw") and has_permission(tid, "banker"):
+    elif data in ("deposit", "withdraw") and (has_permission(tid, "banker") or has_permission(tid, "admin")):
+        if not has_permission(tid, "admin") and not user_player(tid):
+            send(chat_id, "Чтобы банкир не мог провести операцию на собственном счёте, сначала привяжи свой профиль.", menu(tid, show_home=True))
+            return
         begin_state(tid, data)
-        send(chat_id, "Введи Minecraft ник игрока или номер карты. /cancel — отмена.", home_markup())
-    elif data.startswith("bankcard:") and has_permission(tid, "banker"):
+        prompt = "Введи Minecraft ник игрока или номер карты. Администратор может выбрать любой счёт." if has_permission(tid, "admin") else "Введи Minecraft ник игрока или номер карты. Банкир может работать со счетами других игроков, кроме собственного."
+        send(chat_id, prompt, home_markup())
+    elif data.startswith("bankcard:") and (has_permission(tid, "banker") or has_permission(tid, "admin")):
         state = STATES.get(tid)
         if not state or state.get("step") != "select_bank_card":
             return
         _, mode, raw_card_id = data.split(":", 2)
         card_id = int(raw_card_id)
         if mode != state.get("mode"):
+            return
+        own_player = user_player(tid)
+        if not has_permission(tid, "admin") and (not own_player or own_player["id"] == state.get("target")):
+            send(chat_id, "Банкир может вносить или снимать АР на счетах других игроков, но не на своём.", menu(tid, show_home=True))
+            STATES.pop(tid, None)
             return
         with db() as c:
             card = c.execute("SELECT id,number,player_id FROM cards WHERE id=? AND player_id=? AND active=1",
@@ -1172,12 +1394,21 @@ def player_count():
 
 def global_history_text():
     with db() as c:
-        rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver
+        rows = c.execute("""SELECT l.*, a.minecraft_name AS sender, b.minecraft_name AS receiver,
+                (SELECT p.minecraft_name FROM telegram_users t JOIN players p ON p.id=t.player_id WHERE t.telegram_id=l.actor_telegram_id) AS actor_name
             FROM ledger l LEFT JOIN players a ON a.id=l.from_player LEFT JOIN players b ON b.id=l.to_player
             ORDER BY l.id DESC LIMIT 20""").fetchall()
     if not rows:
         return "В журнале пока нет операций."
-    lines = [f"#{r['id']} {r['kind']} · {r['sender'] or 'касса'} → {r['receiver'] or 'касса'} · {r['amount']} АР" + (f" · {r['note']}" if r['note'] else "") for r in rows]
+    lines = []
+    for r in rows:
+        display_kind = {"fine_payment": "Оплата штрафа", "deposit": "Внесение", "withdraw": "Снятие", "transfer": "Перевод"}.get(r["kind"], r["kind"])
+        line = f"#{r['id']} {display_kind} · {r['sender'] or 'касса'} → {r['receiver'] or 'касса'} · {r['amount']} АР"
+        if r["kind"] in ("deposit", "withdraw"):
+            line += f" · банкир: {r['actor_name'] or 'Telegram ID ' + str(r['actor_telegram_id'])}"
+        if r["note"]:
+            line += f" · {r['note']}"
+        lines.append(line)
     return "Последние операции банка:\n" + "\n".join(lines)
 
 
@@ -1222,9 +1453,74 @@ def split_message(text, limit=3600):
     return chunks
 
 
+def start_bank_api():
+    if not BANK_API_PORT:
+        return None
+    if not BANK_API_TOKEN or len(BANK_API_TOKEN) < 32:
+        raise SystemExit("BANK_API_PORT is set but BANK_API_TOKEN is missing or shorter than 32 characters.")
+    if not re.fullmatch(r"[0-9]{1,5}", BANK_API_PORT) or not 1 <= int(BANK_API_PORT) <= 65535:
+        raise SystemExit("BANK_API_PORT must be between 1 and 65535.")
+
+    class Handler(BaseHTTPRequestHandler):
+        def send_json(self, status, value):
+            body = json.dumps(value, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/api/v1/health":
+                self.send_json(200, {"ok": True, "service": "minecraft-ar-bank"})
+            else:
+                self.send_json(404, {"error": "not_found"})
+
+        def do_POST(self):
+            if self.path != "/api/v1/players/sync":
+                self.send_json(404, {"error": "not_found"})
+                return
+            supplied = self.headers.get("Authorization", "")
+            expected = "Bearer " + BANK_API_TOKEN
+            if not hmac.compare_digest(supplied, expected):
+                self.send_json(401, {"error": "unauthorized"})
+                return
+            raw_length = self.headers.get("Content-Length", "")
+            if not re.fullmatch(r"[0-9]{1,6}", raw_length) or int(raw_length) > 65536:
+                self.send_json(413, {"error": "request_too_large"})
+                return
+            try:
+                payload = json.loads(self.rfile.read(int(raw_length)).decode("utf-8"))
+                names = payload.get("players") if isinstance(payload, dict) else None
+                if not isinstance(names, list) or len(names) > 1000:
+                    raise ValueError("players must be an array of at most 1000 names")
+                normalized, seen = [], set()
+                for name in names:
+                    if not isinstance(name, str) or not valid_nickname(name):
+                        raise ValueError("invalid Minecraft nickname in players")
+                    if name.casefold() not in seen:
+                        normalized.append(name)
+                        seen.add(name.casefold())
+                synced = [sync_player(name) for name in normalized]
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                self.send_json(400, {"error": "invalid_request", "message": str(exc)[:160]})
+                return
+            self.send_json(200, {"ok": True, "synced": len(synced), "players": synced})
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("0.0.0.0", int(BANK_API_PORT)), Handler)
+    thread = threading.Thread(target=server.serve_forever, name="bank-api", daemon=True)
+    thread.start()
+    print(f"Bank API listening on 0.0.0.0:{BANK_API_PORT}")
+    return server
+
+
 def main():
     init_db()
     print(f"Telegram bank prototype is polling. SQLite database: {os.path.abspath(DB_PATH)}")
+    start_bank_api()
     offset = 0
     while True:
         try:

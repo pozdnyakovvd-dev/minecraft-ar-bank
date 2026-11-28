@@ -2,9 +2,11 @@
 """Tiny Telegram bank prototype. Python standard library only."""
 
 import json
+import hashlib
 import hmac
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -53,7 +55,8 @@ if not TOKEN and __name__ == "__main__":
 
 API = f"https://api.telegram.org/bot{TOKEN}/"
 BANK_API_TOKEN = os.environ.get("BANK_API_TOKEN", "").strip()
-BANK_API_PORT = os.environ.get("BANK_API_PORT", "").strip()
+BANK_API_PORT = (os.environ.get("BANK_API_PORT", "").strip()
+                 or os.environ.get("PORT", "").strip())
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
 MAX_AMOUNT = 2_147_483_647
 MAX_SQLITE_INTEGER = 9_223_372_036_854_775_807
@@ -117,7 +120,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS telegram_users (
             telegram_id INTEGER PRIMARY KEY,
             player_id INTEGER UNIQUE REFERENCES players(id),
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            verified INTEGER NOT NULL DEFAULT 1 CHECK(verified IN (0,1))
         );
         CREATE TABLE IF NOT EXISTS cards (
             id INTEGER PRIMARY KEY,
@@ -188,11 +192,30 @@ def init_db():
             source_card_id INTEGER REFERENCES cards(id),
             ledger_id INTEGER REFERENCES ledger(id)
         );
+        CREATE TABLE IF NOT EXISTS link_codes (
+            code_hash TEXT PRIMARY KEY,
+            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts (
+            id TEXT PRIMARY KEY,
+            secret_hash TEXT NOT NULL,
+            player_id INTEGER NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+            telegram_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','denied','expired')),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            resolved_at TEXT
+        );
         CREATE INDEX IF NOT EXISTS fines_player_status_idx ON fines(player_id,status,id DESC);
         CREATE INDEX IF NOT EXISTS ledger_from_idx ON ledger(from_player, id DESC);
         CREATE INDEX IF NOT EXISTS ledger_to_idx ON ledger(to_player, id DESC);
         """)
         ledger_columns = {row["name"] for row in c.execute("PRAGMA table_info(ledger)").fetchall()}
+        telegram_columns = {row["name"] for row in c.execute("PRAGMA table_info(telegram_users)").fetchall()}
+        if "verified" not in telegram_columns:
+            c.execute("ALTER TABLE telegram_users ADD COLUMN verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0,1))")
         if "from_card_id" not in ledger_columns:
             c.execute("ALTER TABLE ledger ADD COLUMN from_card_id INTEGER REFERENCES cards(id)")
         if "to_card_id" not in ledger_columns:
@@ -298,6 +321,7 @@ def prompt_reset_confirmation(chat_id, tid):
 def clear_test_data():
     with db() as c:
         c.execute("BEGIN IMMEDIATE")
+        c.execute("DELETE FROM link_codes")
         c.execute("DELETE FROM fines")
         c.execute("DELETE FROM ledger")
         c.execute("DELETE FROM vault_events")
@@ -311,7 +335,7 @@ def clear_test_data():
 
 def user_player(tid):
     with db() as c:
-        row = c.execute("SELECT p.* FROM telegram_users t JOIN players p ON p.id=t.player_id WHERE t.telegram_id=?",
+        row = c.execute("SELECT p.* FROM telegram_users t JOIN players p ON p.id=t.player_id WHERE t.telegram_id=? AND t.verified=1",
                         (tid,)).fetchone()
     return row
 
@@ -371,7 +395,7 @@ def shared_cards(player_id):
 def card_telegram_ids(card_id):
     with db() as c:
         rows = c.execute("""SELECT DISTINCT t.telegram_id FROM telegram_users t
-            WHERE t.player_id IN (
+            WHERE t.verified=1 AND t.player_id IN (
                 SELECT player_id FROM cards WHERE id=?
                 UNION SELECT player_id FROM card_access WHERE card_id=?
             )""", (card_id, card_id)).fetchall()
@@ -451,26 +475,6 @@ def issue_custom_card(player_id, number):
             raise ValueError("Этот номер уже выдавался. Выбери другой пятизначный номер.")
         c.execute("INSERT INTO cards(player_id,number,created_at) VALUES(?,?,?)", (player_id, number, now()))
     return number
-
-
-def register(tid, name):
-    if not valid_nickname(name):
-        if re.fullmatch(r"[0-9]{5}", name):
-            raise ValueError("Ник из ровно пяти цифр нельзя использовать: он совпадает с форматом номера карты.")
-        raise ValueError("Ник должен быть от 3 до 16 символов: латинские буквы, цифры или _.")
-    with db() as c:
-        if c.execute("SELECT 1 FROM telegram_users WHERE telegram_id=?", (tid,)).fetchone():
-            raise ValueError("Этот Telegram уже привязан к банковскому аккаунту.")
-        existing = c.execute("SELECT id FROM players WHERE minecraft_name=? COLLATE NOCASE", (name,)).fetchone()
-        if existing:
-            if c.execute("SELECT 1 FROM telegram_users WHERE player_id=?", (existing["id"],)).fetchone():
-                raise ValueError("Этот игровой аккаунт уже привязан к Telegram.")
-            pid = existing["id"]
-        else:
-            cur = c.execute("INSERT INTO players(minecraft_name,created_at) VALUES(?,?)", (name, now()))
-            pid = cur.lastrowid
-        c.execute("INSERT INTO telegram_users(telegram_id,player_id,created_at) VALUES(?,?,?)", (tid, pid, now()))
-    return pid
 
 
 def add_role(tid, permission):
@@ -655,6 +659,113 @@ def sync_player(name):
         c.execute("INSERT OR IGNORE INTO players(minecraft_name,created_at) VALUES(?,?)", (name, now()))
         row = c.execute("SELECT id,minecraft_name FROM players WHERE minecraft_name=? COLLATE NOCASE", (name,)).fetchone()
     return dict(row)
+
+
+def issue_link_code(name):
+    player = sync_player(name)
+    created = now()
+    expires = (datetime.now(timezone.utc) + timedelta(seconds=60)).isoformat(timespec="seconds")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if c.execute("SELECT 1 FROM telegram_users WHERE player_id=? AND verified=1", (player["id"],)).fetchone():
+            raise ValueError("Этот Minecraft ник уже привязан к Telegram.")
+        c.execute("DELETE FROM link_codes WHERE expires_at<=? OR player_id=?", (created, player["id"]))
+        for _ in range(10):
+            code = f"{secrets.randbelow(100_000_000):08d}"
+            digest = hashlib.sha256(code.encode("ascii")).hexdigest()
+            try:
+                c.execute("INSERT INTO link_codes(code_hash,player_id,created_at,expires_at) VALUES(?,?,?,?)",
+                          (digest, player["id"], created, expires))
+                return {"code": code, "expires_in": 60, "player": player["minecraft_name"]}
+            except sqlite3.IntegrityError:
+                continue
+    raise ValueError("Не удалось создать код. Повтори команду.")
+
+
+def complete_link(telegram_id, code):
+    if not re.fullmatch(r"[0-9]{8}", code):
+        raise ValueError("Код должен состоять из восьми цифр.")
+    digest = hashlib.sha256(code.encode("ascii")).hexdigest()
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("""SELECT lc.player_id,p.minecraft_name FROM link_codes lc
+            JOIN players p ON p.id=lc.player_id WHERE lc.code_hash=? AND lc.expires_at>?""",
+                        (digest, now())).fetchone()
+        if not row:
+            c.execute("DELETE FROM link_codes WHERE code_hash=?", (digest,))
+            raise ValueError("Код неверный или истёк. Запроси новый через /bank link в игре.")
+        current = c.execute("SELECT player_id,verified FROM telegram_users WHERE telegram_id=?", (telegram_id,)).fetchone()
+        if current and (current["verified"] or current["player_id"] != row["player_id"]):
+            raise ValueError("Этот Telegram уже связан с банковским аккаунтом.")
+        old = c.execute("SELECT telegram_id,verified FROM telegram_users WHERE player_id=?", (row["player_id"],)).fetchone()
+        if old and old["verified"]:
+            c.execute("DELETE FROM link_codes WHERE player_id=?", (row["player_id"],))
+            raise ValueError("Этот Minecraft ник уже привязан к Telegram.")
+        if old and old["telegram_id"] != telegram_id:
+            c.execute("DELETE FROM telegram_users WHERE telegram_id=?", (old["telegram_id"],))
+            c.execute("DELETE FROM roles WHERE telegram_id=?", (old["telegram_id"],))
+        if current:
+            c.execute("UPDATE telegram_users SET verified=1,created_at=? WHERE telegram_id=?", (now(), telegram_id))
+        else:
+            c.execute("INSERT INTO telegram_users(telegram_id,player_id,created_at,verified) VALUES(?,?,?,1)",
+                      (telegram_id, row["player_id"], now()))
+        c.execute("DELETE FROM link_codes WHERE player_id=?", (row["player_id"],))
+        return row["minecraft_name"]
+
+
+def create_login_attempt(name):
+    if not valid_nickname(name):
+        raise ValueError("Некорректный Minecraft ник.")
+    created_dt = datetime.now(timezone.utc)
+    created = created_dt.isoformat(timespec="seconds")
+    expires = (created_dt + timedelta(minutes=2)).isoformat(timespec="seconds")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        player = c.execute("SELECT id,minecraft_name FROM players WHERE minecraft_name=? COLLATE NOCASE", (name,)).fetchone()
+        if not player:
+            raise LookupError("Для этого ника нет банковского профиля.")
+        linked = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=? AND verified=1", (player["id"],)).fetchone()
+        if not linked:
+            raise LookupError("Telegram ещё не привязан к этому Minecraft нику.")
+        # Replace older requests for this player so a stale Telegram button cannot authorize another join.
+        c.execute("UPDATE login_attempts SET status='expired',resolved_at=? WHERE player_id=? AND status='pending'", (created, player["id"]))
+        attempt_id = secrets.token_hex(6)
+        secret = secrets.token_hex(8)
+        c.execute("INSERT INTO login_attempts(id,secret_hash,player_id,telegram_id,status,created_at,expires_at) VALUES(?,?,?,?, 'pending',?,?)",
+                  (attempt_id, hashlib.sha256(secret.encode("ascii")).hexdigest(), player["id"], linked["telegram_id"], created, expires))
+        return {"id": attempt_id, "secret": secret, "player": player["minecraft_name"], "telegram_id": linked["telegram_id"], "expires_in": 120}
+
+
+def resolve_login_attempt(attempt_id, telegram_id, approve):
+    if not re.fullmatch(r"[0-9a-f]{12}", attempt_id):
+        raise ValueError("Некорректный запрос входа.")
+    with db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT * FROM login_attempts WHERE id=?", (attempt_id,)).fetchone()
+        if not row or row["telegram_id"] != telegram_id:
+            raise ValueError("Этот запрос входа не найден.")
+        if row["status"] != "pending":
+            return row["status"]
+        if row["expires_at"] <= now():
+            c.execute("UPDATE login_attempts SET status='expired',resolved_at=? WHERE id=? AND status='pending'", (now(), attempt_id))
+            return "expired"
+        status = "approved" if approve else "denied"
+        c.execute("UPDATE login_attempts SET status=?,resolved_at=? WHERE id=? AND status='pending'", (status, now(), attempt_id))
+        return status
+
+
+def poll_login_attempt(attempt_id, secret):
+    if not re.fullmatch(r"[0-9a-f]{12}", attempt_id) or not re.fullmatch(r"[0-9a-f]{16}", secret):
+        raise ValueError("Некорректный запрос входа.")
+    digest = hashlib.sha256(secret.encode("ascii")).hexdigest()
+    with db() as c:
+        row = c.execute("SELECT secret_hash,status,expires_at FROM login_attempts WHERE id=?", (attempt_id,)).fetchone()
+        if not row or not hmac.compare_digest(row["secret_hash"], digest):
+            raise LookupError("Запрос входа не найден.")
+        if row["status"] == "pending" and row["expires_at"] <= now():
+            c.execute("UPDATE login_attempts SET status='expired',resolved_at=? WHERE id=? AND status='pending'", (now(), attempt_id))
+            return "expired"
+        return row["status"]
 
 
 def unpaid_fines(player_id):
@@ -853,13 +964,31 @@ def on_message(message):
         if player:
             send(chat_id, f"Йоу, {player['minecraft_name']}! Это банк сервера.\nВыбери действие:", menu(tid))
         else:
-            send(chat_id, "Йоу! Введи свой Minecraft ник для привязки к этому Telegram аккаунту. Банк доверяет введённому нику.")
-            STATES[tid] = {"mode": "register", "step": "name"}
+            send(chat_id, "Йоу! Для привязки открой Minecraft, войди через AuthMe и выполни /bank link. Введи сюда выданный код — он действует одну минуту.")
+            STATES[tid] = {"mode": "link", "step": "code"}
         return
 
     if text.startswith("/cancel"):
         STATES.pop(tid, None)
         send(chat_id, "Действие отменено.", menu(tid) if player else None)
+        return
+
+    if text and text.split(maxsplit=1)[0].split("@", 1)[0] == "/link":
+        parts = text.split()
+        if len(parts) == 1:
+            STATES[tid] = {"mode": "link", "step": "code"}
+            send(chat_id, "Введи одноразовый восьмизначный код из Minecraft. Он действует одну минуту.")
+            return
+        if len(parts) != 2:
+            send(chat_id, "Формат: /link КОД")
+            return
+        try:
+            linked_name = complete_link(tid, parts[1])
+        except ValueError as exc:
+            send(chat_id, str(exc))
+            return
+        STATES.pop(tid, None)
+        send(chat_id, f"Готово! Minecraft ник {linked_name} привязан к этому Telegram и банковскому профилю. Карта выпускается отдельно.", menu(tid))
         return
 
     if text.startswith("/") and tid in STATES:
@@ -952,7 +1081,7 @@ def on_message(message):
                 STATES.pop(tid, None)
                 send(chat_id, f"Карта {number} выпущена игроку {target_name}.", menu(tid, show_home=True))
                 with db() as c:
-                    target_user = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?", (target_player_id,)).fetchone()
+                    target_user = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=? AND verified=1", (target_player_id,)).fetchone()
                 if target_user:
                     try:
                         send(target_user["telegram_id"], f"Администратор выпустил тебе карту {number}.")
@@ -992,10 +1121,10 @@ def on_message(message):
                 send(chat_id, "Выбери, в пользу кого будет оплачен штраф:", keyboard(rows))
                 return
 
-        if mode == "register" and step == "name":
-            pid = register(tid, text)
+        if mode == "link" and step == "code":
+            linked_name = complete_link(tid, text)
             STATES.pop(tid, None)
-            send(chat_id, f"Аккаунт {text} создан и привязан к этому Telegram. Карты пока нет: выпусти её в разделе «Баланс и карты».", menu(tid))
+            send(chat_id, f"Готово! Minecraft ник {linked_name} привязан к этому Telegram и банковскому профилю. Карта выпускается отдельно.", menu(tid))
             return
 
         if mode == "share" and step == "recipient":
@@ -1104,6 +1233,22 @@ def on_callback(query):
     tid = query["from"]["id"]
     chat_id = query["message"]["chat"]["id"]
     data = query.get("data", "")
+    login_match = re.fullmatch(r"login:(approve|deny):([0-9a-f]{12})", data)
+    if login_match:
+        answer_callback(query["id"])
+        try:
+            status = resolve_login_attempt(login_match.group(2), tid, login_match.group(1) == "approve")
+            if status == "approved":
+                send(chat_id, "✅ Вход в Minecraft разрешён. Если это были не вы, отклоните вход и смените пароль AuthMe.")
+            elif status == "denied":
+                send(chat_id, "⛔ Вход отклонён. Сервер не пустит игрока.")
+            elif status == "expired":
+                send(chat_id, "⌛ Запрос входа уже истёк. Игроку нужно подключиться снова.")
+            else:
+                send(chat_id, "Этот запрос входа уже обработан.")
+        except ValueError as exc:
+            send(chat_id, str(exc))
+        return
     player = user_player(tid)
     answer_callback(query["id"])
     if data == "account" and player:
@@ -1270,7 +1415,7 @@ def on_callback(query):
         STATES.pop(tid, None)
         send(chat_id, f"Штраф #{fine_id} выписан игроку {target_name}: {state['fine_amount']} АР. Он сможет оплатить его после выпуска карты.", menu(tid, show_home=True))
         with db() as c:
-            target_tg = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=?", (target_id,)).fetchone()
+            target_tg = c.execute("SELECT telegram_id FROM telegram_users WHERE player_id=? AND verified=1", (target_id,)).fetchone()
         if target_tg:
             try:
                 send(target_tg["telegram_id"], f"⚖️ Тебе выписан штраф #{fine_id}: {state['fine_amount']} АР. Причина: {state['fine_reason']}\nОткрой «Мои штрафы» в банковском боте для оплаты.", menu(target_tg["telegram_id"], show_home=True))
@@ -1454,10 +1599,12 @@ def split_message(text, limit=3600):
 
 
 def start_bank_api():
-    if not BANK_API_PORT:
+    if not BANK_API_TOKEN:
         return None
-    if not BANK_API_TOKEN or len(BANK_API_TOKEN) < 32:
-        raise SystemExit("BANK_API_PORT is set but BANK_API_TOKEN is missing or shorter than 32 characters.")
+    if len(BANK_API_TOKEN) < 32:
+        raise SystemExit("BANK_API_TOKEN must be at least 32 characters.")
+    if not BANK_API_PORT:
+        raise SystemExit("Set BANK_API_PORT or use the PORT environment variable provided by the host.")
     if not re.fullmatch(r"[0-9]{1,5}", BANK_API_PORT) or not 1 <= int(BANK_API_PORT) <= 65535:
         raise SystemExit("BANK_API_PORT must be between 1 and 65535.")
 
@@ -1473,11 +1620,33 @@ def start_bank_api():
         def do_GET(self):
             if self.path == "/api/v1/health":
                 self.send_json(200, {"ok": True, "service": "minecraft-ar-bank"})
-            else:
+                return
+            parsed = urllib.parse.urlsplit(self.path)
+            match = re.fullmatch(r"/api/v1/login-attempts/([0-9a-f]{12})", parsed.path)
+            if not match:
                 self.send_json(404, {"error": "not_found"})
+                return
+            supplied = self.headers.get("Authorization", "")
+            expected = "Bearer " + BANK_API_TOKEN
+            if not hmac.compare_digest(supplied, expected):
+                self.send_json(401, {"error": "unauthorized"})
+                return
+            try:
+                secret = urllib.parse.parse_qs(parsed.query, strict_parsing=True).get("secret", [""])[0]
+            except ValueError:
+                self.send_json(400, {"error": "invalid_request"})
+                return
+            try:
+                status = poll_login_attempt(match.group(1), secret)
+            except ValueError as exc:
+                self.send_json(400, {"error": "invalid_request", "message": str(exc)})
+            except LookupError as exc:
+                self.send_json(404, {"error": "not_found", "message": str(exc)})
+            else:
+                self.send_json(200, {"ok": True, "status": status})
 
         def do_POST(self):
-            if self.path != "/api/v1/players/sync":
+            if self.path not in ("/api/v1/players/sync", "/api/v1/link-codes", "/api/v1/login-attempts"):
                 self.send_json(404, {"error": "not_found"})
                 return
             supplied = self.headers.get("Authorization", "")
@@ -1491,21 +1660,51 @@ def start_bank_api():
                 return
             try:
                 payload = json.loads(self.rfile.read(int(raw_length)).decode("utf-8"))
-                names = payload.get("players") if isinstance(payload, dict) else None
-                if not isinstance(names, list) or len(names) > 1000:
-                    raise ValueError("players must be an array of at most 1000 names")
-                normalized, seen = [], set()
-                for name in names:
-                    if not isinstance(name, str) or not valid_nickname(name):
-                        raise ValueError("invalid Minecraft nickname in players")
-                    if name.casefold() not in seen:
-                        normalized.append(name)
-                        seen.add(name.casefold())
-                synced = [sync_player(name) for name in normalized]
+                if not isinstance(payload, dict):
+                    raise ValueError("JSON body must be an object")
+                if self.path == "/api/v1/players/sync":
+                    names = payload.get("players")
+                    if not isinstance(names, list) or len(names) > 1000:
+                        raise ValueError("players must be an array of at most 1000 names")
+                    normalized, seen = [], set()
+                    for name in names:
+                        if not isinstance(name, str) or not valid_nickname(name):
+                            raise ValueError("invalid Minecraft nickname in players")
+                        if name.casefold() not in seen:
+                            normalized.append(name)
+                            seen.add(name.casefold())
+                    synced = [sync_player(name) for name in normalized]
+                    result = {"ok": True, "synced": len(synced), "players": synced}
+                else:
+                    name = payload.get("player")
+                    if not isinstance(name, str):
+                        raise ValueError("player must be a Minecraft nickname")
+                    if self.path == "/api/v1/link-codes":
+                        result = {"ok": True, **issue_link_code(name)}
+                    else:
+                        attempt = create_login_attempt(name)
+                        try:
+                            send(attempt["telegram_id"],
+                                 f"🔐 Запрос входа в Minecraft от игрока {attempt['player']}.\n\nЕсли это вы — разрешите вход. Если нет — отклоните. Запрос истечёт через 2 минуты.",
+                                 keyboard([[('✅ Разрешить', f"login:approve:{attempt['id']}"),
+                                           ('⛔ Отклонить', f"login:deny:{attempt['id']}")]]))
+                        except Exception:
+                            with db() as c:
+                                c.execute("UPDATE login_attempts SET status='expired',resolved_at=? WHERE id=? AND status='pending'", (now(), attempt["id"]))
+                            raise RuntimeError("Не удалось отправить запрос в Telegram.")
+                        result = {"ok": True, "id": attempt["id"], "secret": attempt["secret"],
+                                  "expires_in": attempt["expires_in"], "player": attempt["player"]}
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-                self.send_json(400, {"error": "invalid_request", "message": str(exc)[:160]})
+                status = 409 if "already linked" in str(exc).lower() or "уже привязан" in str(exc).lower() else 400
+                self.send_json(status, {"error": "invalid_request", "message": str(exc)[:160]})
                 return
-            self.send_json(200, {"ok": True, "synced": len(synced), "players": synced})
+            except LookupError as exc:
+                self.send_json(404, {"error": "not_linked", "message": str(exc)[:160]})
+                return
+            except RuntimeError as exc:
+                self.send_json(503, {"error": "telegram_unavailable", "message": str(exc)[:160]})
+                return
+            self.send_json(200, result)
 
         def log_message(self, _format, *_args):
             return
